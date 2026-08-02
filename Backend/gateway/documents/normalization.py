@@ -8,7 +8,7 @@ import unicodedata
 _TRAILING_WHITESPACE = re.compile(r"[ \t]+\n")
 _BLANK_LINE_RUNS = re.compile(r"\n{3,}")
 
-PIPELINE_FINGERPRINT_VERSION = "v1"
+PIPELINE_VERSION = "v1"
 
 
 def normalize_text(text: str) -> str:
@@ -30,9 +30,10 @@ def compute_pipeline_fingerprint(
     embedding_model: str,
     ontology_language: str,
     model: str,
+    pipeline_version: str = PIPELINE_VERSION,
 ) -> str:
     payload = {
-        "version": PIPELINE_FINGERPRINT_VERSION,
+        "version": pipeline_version,
         "kg_type": kg_type,
         "prompt_type": prompt_type,
         "embedding_model": embedding_model,

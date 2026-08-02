@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from pathlib import Path
 
 import pytest
@@ -42,7 +43,9 @@ class MemorySessionStore:
 @pytest.fixture()
 def documents_app(tmp_path: Path):
     database_path = tmp_path / "documents.sqlite3"
-    engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{database_path}", connect_args={"timeout": 30}
+    )
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     settings = AuthSettings(
         enabled=True,
@@ -177,6 +180,84 @@ def test_extraction_job_for_missing_document_returns_404(documents_app) -> None:
         )
 
     assert response.status_code == 404
+
+
+def test_extraction_job_stores_full_pipeline_params(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Pipeline parametreleri."}).json()
+        response = client.post(
+            "/api/extraction-jobs",
+            json={
+                "document_id": document["id"],
+                "model": "test-model",
+                "prompt_type": "dspy",
+                "kg_type": "kggen",
+                "embedding_model": "bge_m3",
+                "ontology_language": "tr",
+            },
+        )
+
+    body = response.json()
+    assert body["model"] == "test-model"
+    assert body["prompt_type"] == "dspy"
+    assert body["kg_type"] == "kggen"
+    assert body["embedding_model"] == "bge_m3"
+    assert body["ontology_language"] == "tr"
+    assert body["pipeline_version"] == "v1"
+
+
+def test_concurrent_extraction_job_requests_reuse_single_job(documents_app) -> None:
+    from sqlalchemy import select
+
+    from documents import service
+    from documents.models import Document, ExtractionJob
+
+    app, runtime = documents_app
+    with TestClient(app) as client:
+        document_payload = client.post("/api/documents", json={"text": "Yarış testi."}).json()
+        visitor_id = uuid.UUID(client.get("/api/auth/me").json()["visitor_id"])
+
+    async def scenario():
+        async with runtime.sessions() as db_a, runtime.sessions() as db_b:
+            document_a = await db_a.get(Document, uuid.UUID(document_payload["id"]))
+            document_b = await db_b.get(Document, uuid.UUID(document_payload["id"]))
+            return await asyncio.gather(
+                service.create_or_reuse_extraction_job(
+                    db_a,
+                    document=document_a,
+                    user=None,
+                    visitor_id=visitor_id,
+                    kg_type="wikipedia",
+                    prompt_type="temel",
+                    embedding_model="contriever",
+                    ontology_language="en",
+                    model="race-model",
+                ),
+                service.create_or_reuse_extraction_job(
+                    db_b,
+                    document=document_b,
+                    user=None,
+                    visitor_id=visitor_id,
+                    kg_type="wikipedia",
+                    prompt_type="temel",
+                    embedding_model="contriever",
+                    ontology_language="en",
+                    model="race-model",
+                ),
+            )
+
+    results = asyncio.run(scenario())
+    job_ids = {str(job.id) for job, _created in results}
+    assert len(job_ids) == 1
+
+    async def count_jobs() -> list[ExtractionJob]:
+        async with runtime.sessions() as db:
+            rows = await db.scalars(select(ExtractionJob))
+            return list(rows)
+
+    jobs = asyncio.run(count_jobs())
+    assert len(jobs) == 1
 
 
 def test_login_migrates_anonymous_workspace_to_user(documents_app) -> None:
