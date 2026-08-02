@@ -43,12 +43,23 @@ services:
       MAX_EXTRACTION_CHARS: ${MAX_EXTRACTION_CHARS:-100000}
       MAX_ACTIVE_JOBS_PER_WORKSPACE: ${MAX_ACTIVE_JOBS_PER_WORKSPACE:-3}
       ANONYMOUS_MODEL_ALLOWLIST: ${ANONYMOUS_MODEL_ALLOWLIST:-google/gemini-2.5-flash-lite}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-kg-documents}
+      MAX_PDF_UPLOAD_BYTES: ${MAX_PDF_UPLOAD_BYTES:-20971520}
+      URL_FETCH_TIMEOUT_SECONDS: ${URL_FETCH_TIMEOUT_SECONDS:-15}
+      MAX_URL_CONTENT_BYTES: ${MAX_URL_CONTENT_BYTES:-5242880}
+      MAX_URL_REDIRECTS: ${MAX_URL_REDIRECTS:-5}
     depends_on:
       wikontic:
         condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   extraction-worker:
@@ -85,6 +96,43 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+
+  ingestion-worker:
+    build:
+      context: ./Backend/gateway
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - worker.celery_app
+      - worker
+      - --loglevel=INFO
+      - --concurrency=${INGESTION_WORKER_CONCURRENCY:-2}
+      - -Q
+      - ingestion
+      - -n
+      - ingestion-worker@%h
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kg}:${POSTGRES_PASSWORD:-kg}@postgres:5432/${POSTGRES_DB:-knowledge_graph}
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-kg-documents}
+      MAX_PDF_UPLOAD_BYTES: ${MAX_PDF_UPLOAD_BYTES:-20971520}
+      URL_FETCH_TIMEOUT_SECONDS: ${URL_FETCH_TIMEOUT_SECONDS:-15}
+      MAX_URL_CONTENT_BYTES: ${MAX_URL_CONTENT_BYTES:-5242880}
+      MAX_URL_REDIRECTS: ${MAX_URL_REDIRECTS:-5}
+      INGESTION_MAX_RETRIES: ${INGESTION_MAX_RETRIES:-2}
+      INGESTION_RETRY_BACKOFF_SECONDS: ${INGESTION_RETRY_BACKOFF_SECONDS:-20}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
 
   celery-beat:
@@ -129,6 +177,26 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
+      retries: 12
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      # PDF uploads use presigned PUT URLs the browser calls directly, so the
+      # S3 API port must be reachable from outside the docker network too.
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
       retries: 12
 
   wikontic:
@@ -187,6 +255,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  minio_data:
   wikontic_mongo_data:
   wikontic_mongo_config:
   wikontic_models:

@@ -84,7 +84,7 @@ def _build_documents_app(tmp_path: Path):
 def documents_app(tmp_path: Path, monkeypatch):
     # These tests exercise the HTTP layer, not the Celery dispatch; avoid a real
     # (and here, unreachable) broker call on every job-creation test.
-    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+    monkeypatch.setattr(documents_routes.worker_tasks.run_extraction_job, "delay", lambda *a, **kw: None)
     # These tests use placeholder model ids; the OpenRouter allow-list is
     # covered separately in tests/test_policy.py and below via strict_documents_app.
     monkeypatch.setattr("catalog.registry.is_model_allowed", lambda *a, **kw: True)
@@ -98,7 +98,7 @@ def documents_app(tmp_path: Path, monkeypatch):
 def strict_documents_app(tmp_path: Path, monkeypatch):
     # Same as documents_app but with the real OpenRouter allow-list enforced,
     # for testing extraction policy rejections end-to-end.
-    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+    monkeypatch.setattr(documents_routes.worker_tasks.run_extraction_job, "delay", lambda *a, **kw: None)
 
     app, runtime, engine = _build_documents_app(tmp_path)
     yield app, runtime

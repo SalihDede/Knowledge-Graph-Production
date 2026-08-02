@@ -90,7 +90,7 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 - [x] Anonim oturum göstergesi
 - [x] Giriş ve hesap oluşturma ekranları
 - [x] Anonim geçmişi hesaba aktarma akışı (giriş yapınca aynı workspace geçmişi otomatik görünür, bkz. "Workspace geçmişi ve triple review")
-- [ ] Text, PDF ve URL girişi
+- [x] Text, PDF ve URL girişi (kaynak türü seçici, PDF yükleme ilerlemesi, ingestion polling, hazır olunca otomatik extraction başlatma, geçmişte PDF sayfa sayısı/URL kaynağı gösterimi — bkz. "Doküman ingestion (PDF/URL)")
 - [x] Extraction job durumunu gösterme (doküman → job → polling → triple akışı, bkz. "Frontend async extraction akışı")
 - [x] Bekliyor, çalışıyor, tamamlandı ve hata durumları (`queued`/`running` → "Çalışıyor", `completed` → "Hazır", `failed` → "Hata")
 - [x] Geçmiş doküman ve extraction listesi (sidebar'daki Geçmiş paneli)
@@ -107,7 +107,7 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 Mevcut gateway korunacak ve modüler bir yapıya ayrılacaktır.
 
 - [x] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları (`models` artık ayrı bir `catalog` modülünde)
-- [ ] Text, PDF ve URL girişlerini ortak doküman modeline dönüştürme (ilk aşamada yalnızca düz metin destekleniyor)
+- [x] Text, PDF ve URL girişlerini ortak doküman modeline dönüştürme (bkz. "Doküman ingestion (PDF/URL)")
 - [x] Doküman hash'i ve pipeline fingerprint üretme
 - [x] Extraction job oluşturma
 - [x] Job'a tüm pipeline parametrelerini (model, kg_type, prompt_type, embedding_model, ontology_language) ve pipeline_version'ı kaydetme
@@ -136,6 +136,7 @@ PostgreSQL tabloları:
 - [x] `extraction_jobs`
 - [x] `triples`
 - [x] `triple_evidence`
+- [x] `document_segments`
 - [ ] `verification_results`
 - [ ] `pipeline_runs`
 - [ ] `usage_records`
@@ -150,7 +151,7 @@ Altyapı işleri:
 - [ ] Yedekleme politikası
 - [ ] Veri silme ve saklama süreleri
 - [ ] MongoDB profil ve index sağlık kontrolleri
-- [ ] S3/MinIO dosya deposu entegrasyonu
+- [x] S3/MinIO dosya deposu entegrasyonu (yalnızca PDF binary'leri; bkz. "Doküman ingestion (PDF/URL)")
 
 ### 6. Worker ve cron işlemleri
 
@@ -159,7 +160,7 @@ Uzun süren işlemler API container'ında çalıştırılmayacaktır.
 Worker kuyrukları:
 
 - [x] `extraction`: triple çıkarma
-- [ ] `ingestion`: PDF, OCR, scraping ve metin temizleme
+- [x] `ingestion`: PDF, OCR, scraping ve metin temizleme (bkz. "Doküman ingestion (PDF/URL)")
 - [ ] `chunking`: parent-child chunk üretimi
 - [ ] `verification`: RAG doğrulama
 - [ ] `consensus`: çoklu model değerlendirmesi
@@ -239,16 +240,21 @@ PostgreSQL şeması backend başlarken Alembic tarafından otomatik uygulanır. 
 Her anonim ziyaretçi veya kullanıcı için otomatik olarak bir çalışma alanı (`workspace`) oluşturulur. Kullanıcı giriş yaptığında, anonim oturumdaki çalışma alanı otomatik olarak hesaba taşınır.
 
 ```text
-POST /api/documents
+POST /api/documents          (POST /api/documents/text ile aynı, geriye dönük uyumluluk için ikisi de var)
 GET  /api/documents
 GET  /api/documents/{id}
+GET  /api/documents/{id}/ingestion
+
+POST /api/uploads/presign
+POST /api/documents/pdf
+POST /api/documents/url
 
 POST /api/extraction-jobs
 GET  /api/extraction-jobs
 GET  /api/extraction-jobs/{id}
 ```
 
-Doküman oluşturma isteği:
+Doküman oluşturma isteği (düz metin):
 
 ```json
 {
@@ -258,6 +264,8 @@ Doküman oluşturma isteği:
 ```
 
 Gönderilen metin normalize edilir (Unicode NFC, satır sonu ve boşluk temizliği) ve SHA-256 ile hashlenir. Aynı çalışma alanında aynı içerik hash'ine sahip bir doküman zaten varsa yeni kayıt açılmaz, mevcut doküman `200` ile döndürülür; yeni bir doküman oluşturulduğunda cevap `201` olur.
+
+PDF ve URL dokümanları da aynı `documents` tablosuna, aynı `source_type`/`ingestion_status` alanlarıyla yazılır — ayrıntılar için "Doküman ingestion (PDF/URL)" bölümüne bakın. Bir dokümanın `ingestion_status`'u `ready` olana kadar o doküman için extraction job açılamaz; deneme `409` ile reddedilir.
 
 Extraction job oluşturma isteği:
 
@@ -290,6 +298,80 @@ Job oluşturmadan önce istek "Extraction policy" bölümünde açıklanan kontr
 ```
 
 Cevaptaki her satır (`ExtractionJobSummary`) doküman başlığını, ilk ~200 karakterlik bir önizlemeyi ve o job'a ait triple sayısını içerir; dokümanın tam `raw_text`/`normalized_text` içeriğini **hiçbir zaman** döndürmez — bunun için ayrıca `GET /api/documents/{id}` çağrılmalıdır. Liste her zaman çağıranın kendi çalışma alanına göre filtrelenir; başka bir workspace'in job'ları hiçbir koşulda görünmez.
+
+## Doküman ingestion (PDF/URL)
+
+Text, PDF ve URL kaynaklarının hepsi aynı `documents` / `document_segments` yapısına dönüşür — parent-child chunking ve RAG doğrulama gibi sonraki aşamalar, kaynağın ne olduğundan bağımsız olarak tek bir doküman modeliyle çalışır.
+
+```text
+Text  ──────────────────────────────┐
+PDF   → presign → MinIO'ya yükleme ─┼─→ Document (pending) ─→ ingestion worker ─→ Document (ready/failed) + document_segments
+URL   → SSRF kontrolü ──────────────┘
+```
+
+**PDF akışı:**
+
+```text
+POST /api/uploads/presign        {filename, content_type} → {upload_url, storage_key, expires_in_seconds}
+        ↓ (tarayıcı upload_url'e PUT ile PDF'i doğrudan MinIO'ya yükler — dosya hiçbir zaman backend'den geçmez)
+POST /api/documents/pdf          {storage_key, title?} → Document(source_type=pdf, ingestion_status=pending)
+        ↓ (worker.ingestion_tasks.ingest_pdf_document Celery'ye gönderilir)
+GET /api/documents/{id}/ingestion  (polling)
+```
+
+`POST /api/documents/pdf`, `storage_key`'in çağıranın kendi çalışma alanına ait olduğunu (`{workspace_id}/...` öneki) ve MinIO'da gerçekten yüklenmiş, `MAX_PDF_UPLOAD_BYTES`'ı aşmayan bir nesne olduğunu doğrular; aksi halde sırasıyla `403`/`404`/`422` döner.
+
+**URL akışı:**
+
+```text
+POST /api/documents/url          {url, title?}
+        ↓ (SSRF kontrolü — assert_public_url — herhangi bir DB kaydı açılmadan ÖNCE çalışır)
+Document(source_type=url, ingestion_status=pending)
+        ↓ (worker.ingestion_tasks.ingest_url_document Celery'ye gönderilir)
+GET /api/documents/{id}/ingestion  (polling)
+```
+
+Aynı çalışma alanında aynı `url` için zaten `failed` olmayan bir doküman varsa yeniden kullanılır (`200`); yeni oluşturulduğunda `201` ve yalnızca bu durumda yeni bir ingestion job'ı kuyruğa alınır.
+
+`GET /api/documents/{id}/ingestion` cevabı (`DocumentIngestionResponse`): `ingestion_status` (`pending` → `processing` → `ready`/`failed`), `ingestion_error`, `page_count`, `segment_count`.
+
+Mimari notları:
+
+- **PDF binary'si PostgreSQL'e hiç yazılmaz.** Backend yalnızca MinIO'daki nesnenin `storage_key`'ini saklar; tarayıcı presigned URL ile doğrudan MinIO'ya yükler (`storage.py`, `boto3`).
+- **Sayfa ve paragraf konumları korunur.** `document_segments` tablosu her sayfa (`segment_type=page`) ve her paragraf (`segment_type=paragraph`) için `page_number` (yalnızca PDF'te; URL paragraflarında `null`), `ordinal`, `char_start`/`char_end` (dokümanın tam metni içindeki mutlak konum) ve `text` saklar — `full_text[char_start:char_end] == text` her zaman doğrudur.
+- **Taranmış (metin katmanı olmayan) PDF sayfaları OCR'a düşer.** `pypdf` bir sayfadan metin çıkaramazsa `pdf2image` (poppler) + `pytesseract` (tesseract, `tur`+`eng` dil paketleriyle) o sayfayı görüntüye çevirip OCR'lar. OCR bağımlılıkları (poppler/tesseract) sistemde yoksa veya OCR başarısız olursa sayfa boş metinle devam eder — hiçbir sayfa için istisna fırlatılmaz; yalnızca dokümanın **hiçbir** sayfasından (OCR dahil) metin çıkmazsa doküman `failed` olur.
+- **SSRF koruması iki katmanlıdır.** `ingestion/ssrf.py::assert_public_url`, host adını çözüp (`socket.getaddrinfo`) sonuçtaki her IP'nin private/loopback/link-local/reserved/multicast/unspecified olmadığını kontrol eder (RFC 1918, `127.0.0.1`, bulut metadata endpoint'i `169.254.169.254` dahil). Bu kontrol hem ilk istek öncesi hem de **her yönlendirme (redirect) adımından sonra** tekrar çalışır (`ingestion/url_fetch.py`, `httpx` ile manuel — otomatik olmayan — redirect takibi); ilk URL güvenli görünse bile bir redirect iç ağa yönlendirebilir.
+- **Boyut ve zaman sınırları.** `MAX_PDF_UPLOAD_BYTES`, `URL_FETCH_TIMEOUT_SECONDS`, `MAX_URL_CONTENT_BYTES` (stream sırasında sayılır, aşılırsa bağlantı hemen kesilir), `MAX_URL_REDIRECTS`.
+- **Dosya/URL içeriği magic-byte ile doğrulanır.** PDF metin çıkarma öncesi baytların `%PDF-` ile başladığı kontrol edilir; URL cevabının `content-type`'ı `html`/`text` içermiyorsa (ör. bir PDF veya binary dosyaya yönlendirilmişse) istek reddedilir.
+- **Ayrı Celery kuyruğu.** `ingestion-worker` container'ı yalnızca `ingestion` kuyruğunu tüketir (`-Q ingestion`), `extraction-worker`'dan bağımsız ölçeklenir. `worker/ingestion_tasks.py`, extraction worker'la aynı atomik sahiplenme (`pending → processing`, 0 satır etkilenirse no-op) ve sınırlı retry (`INGESTION_MAX_RETRIES`/`INGESTION_RETRY_BACKOFF_SECONDS`) desenini kullanır.
+- **Retry'da duplicate segment oluşmaz.** Ingestion tamamlandığında (`_finish_ready`), o dokümana ait önceki `document_segments` satırları silinip yenileri eklenir (`replace_segments_for_document` — extraction worker'ın `replace_triples_for_job`'ıyla aynı sil-ve-yeniden-yaz deseni), bu yüzden bir job kaç kez yeniden denenirse denensin segment çoğalmaz.
+- **Aynı içerik iki kez ingest edilmez.** PDF/URL'den çıkarılan nihai metin de düz metin dokümanlarıyla aynı `content_hash` + `(workspace_id, content_hash)` unique index'inden geçer; aynı çalışma alanında aynı içerik hash'ine sahip bir doküman zaten varsa `mark_ingestion_ready` bunu `409` bir `PolicyError`'a çevirir.
+
+Ortam değişkenleri (`.env.example`):
+
+```env
+MINIO_PORT=9000
+MINIO_CONSOLE_PORT=9001
+MINIO_PUBLIC_ENDPOINT=http://localhost:9000
+MINIO_ACCESS_KEY=minioadmin
+MINIO_SECRET_KEY=minioadmin
+MINIO_BUCKET=kg-documents
+
+MAX_PDF_UPLOAD_BYTES=20971520
+URL_FETCH_TIMEOUT_SECONDS=15
+MAX_URL_CONTENT_BYTES=5242880
+MAX_URL_REDIRECTS=5
+
+INGESTION_WORKER_CONCURRENCY=2
+INGESTION_MAX_RETRIES=2
+INGESTION_RETRY_BACKOFF_SECONDS=20
+```
+
+`MINIO_PUBLIC_ENDPOINT`, presigned URL'lerin imzalandığı adrestir ve tarayıcının erişebileceği bir adres olmalıdır — Docker network'ü içindeki `minio:9000` hostname'i tarayıcıdan çözülemez, bu yüzden backend-MinIO iletişimi (`MINIO_ENDPOINT`, varsayılan `http://minio:9000`) ile tarayıcı-MinIO iletişimi (`MINIO_PUBLIC_ENDPOINT`) kasıtlı olarak ayrı tutulur.
+
+Frontend tarafı: `Frontend/src/App.jsx`'teki araştırma metni girişinin üstüne bir kaynak türü seçici (Metin/PDF/URL) eklendi. PDF seçildiğinde dosya seçimi + `XMLHttpRequest` ile yükleme ilerlemesi (fetch'in upload-progress event'i olmadığı için) gösterilir; URL seçildiğinde bir adres girişi sunulur. Her iki durumda da doküman oluşturulduktan sonra `GET /api/documents/{id}/ingestion` 2 saniyede bir poll edilir; durum `ready`'ye geçtiğinde çıkarılan metin araştırma metni alanına yazılır ve ilk extraction job'ı otomatik olarak başlatılır (kullanıcının ayrıca "Karşılaştırma Ekle"ye basmasına gerek kalmaz); `failed` olursa `ingestion_error` inline gösterilir. Sidebar'daki Geçmiş paneli artık her satırda kaynağa göre bir rozet gösterir: PDF için sayfa sayısı, URL için kaynak host adı (`ExtractionJobSummary`'ye eklenen `document_source_type`/`document_page_count`/`document_source_url` alanlarından).
+
+Testler: `tests/test_ssrf.py`, `tests/test_segmentation.py`, `tests/test_pdf_ingestion.py` (gerçek `reportlab` PDF'leriyle metin çıkarma, sayfa/OCR fallback, offset doğrulama), `tests/test_url_ingestion.py` (`httpx.MockTransport` ile redirect/boyut/content-type senaryoları, gerçek `trafilatura` ile ana içerik çıkarma), `tests/test_document_ingestion_endpoints.py` (presign/pdf/url endpoint'leri, ready-gate `409`) ve `Frontend/src/api/extraction.test.js`'e eklenen `presignUpload`/`createPdfDocument`/`createUrlDocument`/`getDocumentIngestion`/`uploadFileToPresignedUrl` testleri.
 
 ## Extraction policy
 

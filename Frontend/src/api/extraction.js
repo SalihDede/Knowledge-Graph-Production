@@ -34,6 +34,57 @@ export function getDocument(documentId) {
   return apiRequest(`/api/documents/${documentId}`)
 }
 
+export function presignUpload(filename, contentType = 'application/pdf') {
+  return apiRequest('/api/uploads/presign', {
+    method: 'POST',
+    body: JSON.stringify({ filename, content_type: contentType }),
+  })
+}
+
+// Uses XMLHttpRequest (not fetch) specifically because fetch has no
+// upload-progress event -- the caller needs live percentage feedback while
+// the (potentially large) PDF streams directly to MinIO.
+export function uploadFileToPresignedUrl(uploadUrl, file, { onProgress } = {}) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('PUT', uploadUrl)
+    xhr.setRequestHeader('Content-Type', file.type || 'application/pdf')
+
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable && onProgress) {
+        onProgress(event.loaded / event.total)
+      }
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve()
+      } else {
+        reject(new Error(`Dosya yüklenemedi (HTTP ${xhr.status})`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('Dosya yüklenirken bir ağ hatası oluştu'))
+    xhr.send(file)
+  })
+}
+
+export function createPdfDocument(storageKey, title) {
+  return apiRequest('/api/documents/pdf', {
+    method: 'POST',
+    body: JSON.stringify(title ? { storage_key: storageKey, title } : { storage_key: storageKey }),
+  })
+}
+
+export function createUrlDocument(url, title) {
+  return apiRequest('/api/documents/url', {
+    method: 'POST',
+    body: JSON.stringify(title ? { url, title } : { url }),
+  })
+}
+
+export function getDocumentIngestion(documentId) {
+  return apiRequest(`/api/documents/${documentId}/ingestion`)
+}
+
 export function createExtractionJob({
   documentId,
   model,

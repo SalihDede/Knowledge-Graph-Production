@@ -48,7 +48,7 @@ class MemorySessionStore:
 def triples_app(tmp_path: Path, monkeypatch):
     # These tests exercise the HTTP layer, not the Celery dispatch; avoid a real
     # (and here, unreachable) broker call on every job-creation test.
-    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+    monkeypatch.setattr(documents_routes.worker_tasks.run_extraction_job, "delay", lambda *a, **kw: None)
     # These tests use placeholder model ids; the OpenRouter allow-list is
     # covered separately in tests/test_policy.py.
     monkeypatch.setattr("catalog.registry.is_model_allowed", lambda *a, **kw: True)

@@ -27,9 +27,14 @@ celery_app.conf.update(
             "schedule": float(os.getenv("JOB_RECOVERY_SWEEP_SECONDS", "60")),
         },
     },
+    # PDF/URL ingestion (text extraction, OCR, scraping) runs on its own
+    # queue/worker so a slow OCR job never delays queued extraction jobs.
+    task_routes={
+        "worker.ingestion_tasks.*": {"queue": "ingestion"},
+    },
 )
 
-# Imported for its side effect: registers run_extraction_job on this app.
-# Deferred to the bottom of the module because tasks.py imports celery_app
-# back from here.
+# Imported for their side effects: registers tasks on this app. Deferred to
+# the bottom of the module because they import celery_app back from here.
 from . import tasks  # noqa: E402, F401
+from . import ingestion_tasks  # noqa: E402, F401

@@ -275,6 +275,9 @@ export const UI_TEXT = {
       untitledDocument: 'Başlıksız doküman',
       tripleUnit: 'triple',
       requestIdLabel: 'İstek kimliği',
+      sourcePdf: 'PDF',
+      sourceUrl: 'URL',
+      pageUnit: 'sayfa',
       statuses: {
         queued: 'Sırada',
         running: 'Çalışıyor',
@@ -572,6 +575,9 @@ export const UI_TEXT = {
       untitledDocument: 'Untitled document',
       tripleUnit: 'triples',
       requestIdLabel: 'Request ID',
+      sourcePdf: 'PDF',
+      sourceUrl: 'URL',
+      pageUnit: 'pages',
       statuses: {
         queued: 'Queued',
         running: 'Running',
