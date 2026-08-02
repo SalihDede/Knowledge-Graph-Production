@@ -33,8 +33,8 @@ class IdentityMiddleware(BaseHTTPMiddleware):
         if session_token:
             try:
                 session_data = await self.runtime.session_store.get(session_token)
-            except Exception:
-                logger.exception("Authentication session lookup failed")
+            except Exception as exc:
+                logger.error("Authentication session lookup failed: %s", type(exc).__name__)
                 session_data = None
             if session_data:
                 async with self.runtime.sessions() as db:
