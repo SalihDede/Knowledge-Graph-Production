@@ -1,0 +1,16 @@
+.git
+.DS_Store
+.env
+__pycache__
+.pytest_cache
+*.pyc
+analysis
+datasets
+inference_and_eval
+lib
+media
+pages
+preprocessing
+refImages
+tutorial.ipynb
+wiki_extract_output.txt

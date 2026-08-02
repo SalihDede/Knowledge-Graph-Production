@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+requests
+beautifulsoup4
+httpx>=0.24.0
+dspy-ai>=2.4
+textgrad>=0.1.5
+openai>=1.40
+kg-gen>=0.4.0

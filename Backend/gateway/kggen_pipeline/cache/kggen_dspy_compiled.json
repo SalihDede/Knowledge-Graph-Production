@@ -1,0 +1,42 @@
+{
+  "predict": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "kaynak_metin": "Mustafa Kemal Atatürk (1881-1938) Türkiye Cumhuriyeti kurucusudur.",
+        "kggen_iliskiler": "[\n  {\n    \"subject\": \"Mustafa Kemal Atatürk\",\n    \"relation\": \"founded\",\n    \"object\": \"Republic of Turkey\"\n  }\n]",
+        "bilgi_grafigi": "{\n  \"triplets\": [\n    {\n      \"subject\": \"Mustafa Kemal Atatürk\",\n      \"relation\": \"kurucusu\",\n      \"object\": \"Türkiye Cumhuriyeti\",\n      \"qualifiers\": [\n        {\n          \"relation\": \"doğum tarihi\",\n          \"object\": \"1881\"\n        },\n        {\n          \"relation\": \"ölüm tarihi\",\n          \"object\": \"1938\"\n        }\n      ],\n      \"subject_type\": \"Kişi\",\n      \"object_type\": \"Devlet\",\n      \"kaynak_cumle\": \"Mustafa Kemal Atatürk (1881-1938) Türkiye Cumhuriyeti kurucusudur.\"\n    }\n  ]\n}"
+      }
+    ],
+    "signature": {
+      "instructions": "Convert KG-Gen relation tuples into strict JSON.\n\nUse these rules:\n- Keep only source-supported relations.\n- Convert extracted values to Turkish.\n- Add subject_type, object_type, qualifiers, and kaynak_cumle when supported.\n- Return only valid JSON with a triplets list.\n\nFull rules:\n{BASE_PROMPT}",
+      "fields": [
+        {
+          "prefix": "Kaynak Metin:",
+          "description": "Original source text."
+        },
+        {
+          "prefix": "Kggen Iliskiler:",
+          "description": "KG-Gen relations as JSON."
+        },
+        {
+          "prefix": "Reasoning:",
+          "description": "${reasoning}"
+        },
+        {
+          "prefix": "Bilgi Grafigi:",
+          "description": "Valid JSON object with a triplets list."
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.13",
+      "dspy": "3.2.1",
+      "cloudpickle": "3.1"
+    }
+  }
+}

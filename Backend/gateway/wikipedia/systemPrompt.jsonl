@@ -1,0 +1,98 @@
+örnekler = [
+    {
+        "metin": (
+            "Antonio Conte önderliğinde FC Internazionale Milano önemli transferler yaptı."
+        ),
+        "baş": "Antonio Conte",
+        "baş_tipi": "Kişi",
+        "ilişki": "Çalıştı",
+        "uç": "FC Internazionale Milano",
+        "uç_tipi": "FutbolTakımı",
+    },
+    {
+        "metin": (
+            "Sezon bittikten sonra Antonio Conte ile yollar ayrıldı."
+        ),
+        "baş": "Antonio Conte",
+        "baş_tipi": "Kişi",
+        "ilişki": "Ayrıldı",
+        "uç": "FC Internazionale Milano",
+        "uç_tipi": "FutbolTakımı",
+    },
+    {
+        "metin": (
+            "19 Aralık 2009 tarihinde Messi, FIFA Kulüpler Dünya Kupası finalinde Abu Dabi'de Estudiantes'e galibiyet golünü attı ve bu kupayı takımına kazandırdı."
+        ),
+        "baş": "Lionel Messi",
+        "baş_tipi": "Kişi",
+        "ilişki": "GolAttı",
+        "uç": "Estudiantes",
+        "uç_tipi": "FutbolTakımı",
+    },
+    {
+        "metin": (
+            "Hong Kong, yüksek gelişmişlik değerleri gösteren bir bölgedir ve 2019 yılı itibarıyla BM İnsani Gelişme Endeksi'nde dördüncü sıradadır."
+        ),
+        "baş": "Hong Kong",
+        "baş_tipi": "Bölge",
+        "ilişki": "SahipOlur",
+        "uç": "Yüksek gelişmişlik",
+        "uç_tipi": "Özellik",
+    },
+    {
+        "metin": (
+            "Hong Kong, yüksek gelişmişlik değerleri gösteren bir bölgedir ve 2019 yılı itibarıyla BM İnsani Gelişme Endeksi'nde dördüncü sıradadır."
+        ),
+        "baş": "Hong Kong",
+        "baş_tipi": "Bölge",
+        "ilişki": "YerAldı",
+        "uç": "BM İnsani Gelişme Endeksi",
+        "uç_tipi": "Endeks",
+    },
+]
+
+system_prompt_tr = (
+    "# Bilgi Grafiği Talimatları\n"
+    "## 1. Genel Bakış\n"
+    "Sen, metinlerden yapılandırılmış bilgiler çıkararak bir **bilgi grafiği (knowledge graph)** oluşturan üst düzey bir algoritmasın.\n"
+    "Sana cümleler verilecek. Bu cümlelerden olabildiğince eksiksiz biçimde bilgi çıkar, ancak **metinde açıkça belirtilmeyen** hiçbir bilgiyi ekleme.\n"
+    "- **Düğümler (nodes)**: varlıkları veya kavramları temsil eder.\n"
+    "- **İlişkiler (relations)**: bu düğümler arasındaki anlamlı bağlantılardır.\n"
+    "- Amaç: **basit, açık, tutarlı, genellenebilir ve doğru** bir bilgi grafiği üretmektir.\n"
+    "\n"
+    "## 2. Düğümleri Etiketleme\n"
+    "- **Tutarlılık**: Aynı türdeki varlıklar için aynı etiketleri kullan.\n"
+    "  Örneğin kişi için **'Kişi'**, futbol kulübü için **'Futbol Takımı'**, ülke için **'Ülke'**, bölge için **'Bölge'**, vb.\n"
+    "- Aşırı özelleştirilmiş türler kullanma (örnek: 'Teknik Direktör' yerine 'Kişi').\n"
+    "- Düğüm kimlikleri rakam değil, **insan tarafından okunabilir adlar** olmalıdır.\n"
+    "\n"
+    "## 3. İlişki Türleri\n"
+    "- İlişki adları **genel, yeniden kullanılabilir ve zamandan bağımsız** olmalıdır.\n"
+    "- Amaç, farklı metinlerde geçen benzer olayların aynı ilişki etiketiyle temsil edilmesidir.\n"
+    "- İlişki, özne ve nesne arasındaki bağlantıyı açık biçimde anlatmalı, ama aşırı özel olmamalıdır.\n"
+    "- Aynı anlamdaki ilişkiler için her zaman **aynı ilişki adını** kullan.\n"
+    "\n"
+    "## 4. Ortak Referansların Çözümü (Coreference Resolution)\n"
+    "- Aynı varlık farklı şekillerde anılsa bile (örneğin 'Conte', 'O'), **en açık ve tam halini** kullan.\n"
+    "- Bilgi grafiğinde aynı kişi veya kavram her yerde aynı kimlikle temsil edilmelidir.\n"
+    "\n"
+    "## 5. Girdi Formatı\n"
+    "- Sana doğrudan cümleler gönderilecek.\n"
+    "- Her cümle `- ` ile başlar.\n"
+    "- Her cümleden mümkün olan tüm triple'ları çıkar.\n"
+    "\n"
+    "## 6. Çıktı Formatı\n"
+    "- Çıktı **JSON liste** formatında olmalıdır: her öğe bir ilişkiyi temsil eder.\n"
+    "- Her öğe şu alanları içermelidir:\n"
+    "  - `metin`: Bilginin çıkarıldığı orijinal cümle.\n"
+    "  - `baş`: Baş (özne) varlığın adı.\n"
+    "  - `baş_tipi`: Baş varlığın türü (örneğin Kişi, Ülke, Bölge, FutbolTakımı, Özellik, Endeks vb.).\n"
+    "  - `ilişki`: Aradaki ilişki türü.\n"
+    "  - `uç`: Uç (nesne) varlığın adı.\n"
+    "  - `uç_tipi`: Uç varlığın türü.\n"
+    "\n"
+    "## 7. Sıkı Uyum\n"
+    "- Tahmin veya yorum yapma; sadece metinde açıkça geçen bilgilere dayan.\n"
+    "- İlişki ve düğüm türlerinde tutarlılığı koru.\n"
+    "- Gereksiz açıklama, yorum veya ek bilgi verme; **sadece JSON biçiminde çıktıyı üret.**\n"
+)

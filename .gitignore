@@ -1,0 +1,12 @@
+.env
+.DS_Store
+**/node_modules/
+**/dist/
+**/.vite/
+**/__pycache__/
+**/.pytest_cache/
+
+# Import sources are kept locally as references. Active copies live under
+# Frontend/ and Backend/.
+Bilgi-Grafi-i-Product-Phase/
+wikontic-turkish/

@@ -1,0 +1,11 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30,<1
+httpx>=0.27,<1
+pydantic>=2.9,<3
+python-dotenv>=1,<2
+pyvis>=0.3.2,<1
+openai>=1.50,<3
+dspy-ai>=2.5,<4
+torch==2.6.0
+kg-gen>=0.2,<1
+textgrad>=0.1,<1

@@ -1,0 +1,18 @@
+# Backend Python requirements
+# Oluşturuldu otomatik olarak: ihtiyaç duyulan paketler ve bazı öneriler.
+
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+python-dotenv
+pyvis>=0.3.2
+openai
+dspy
+kg-gen
+textgrad
+
+# Notlar:
+# - `pyvis` zaten frontend/visualization/requirements.txt içinde listelenmişti.
+# - `kg-gen` import olarak `kg_gen` kullanılıyor; eğer pip'de farklı isim varsa düzeltin.
+# - Versiyon sabitlemesi isterseniz hangi paket için istediğinizi söyleyin, ben eklerim.

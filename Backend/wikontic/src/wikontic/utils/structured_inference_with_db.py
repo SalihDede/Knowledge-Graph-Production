@@ -1,0 +1,1060 @@
+from unidecode import unidecode
+import json
+import re
+import warnings
+from typing import Dict, List, Tuple
+from langchain.tools import tool
+import logging
+
+from .base_inference_with_db import BaseInferenceWithDB
+from .run_logger import start_run, log_artifact, finish_run
+from .timing_utils import StageTimer
+from .sentence_splitter import split_sentences
+from .sentence_matcher import enrich_triplets_with_sentence_ids
+from .llm_client_logger import set_llm_context
+from .paper_report import build_paper_report
+from ..profiles.runtime_profile import DEFAULT_RUNTIME_PROFILE, RuntimeProfile
+
+warnings.filterwarnings("ignore")
+logger = logging.getLogger("StructuredInferenceWithDB")
+logger.setLevel(logging.ERROR)
+
+# ── Reason Codes ──────────────────────────────────────────────────────────────
+REASON_INVALID_TRIPLET_FORMAT   = "INVALID_TRIPLET_FORMAT"
+REASON_ENTITY_TYPE_NOT_FOUND    = "ENTITY_TYPE_NOT_FOUND"
+REASON_PROPERTY_NOT_IN_ONTOLOGY = "PROPERTY_NOT_IN_ONTOLOGY"
+REASON_ONTOLOGY_VIOLATION       = "ONTOLOGY_VIOLATION"
+REASON_LLM_REFINE_FAILED        = "LLM_REFINE_FAILED"
+
+_EXCEPTION_REASON_MAP = [
+    ("format",  REASON_INVALID_TRIPLET_FORMAT),
+    ("parse",   REASON_INVALID_TRIPLET_FORMAT),
+    ("json",    REASON_INVALID_TRIPLET_FORMAT),
+    ("key",     REASON_INVALID_TRIPLET_FORMAT),
+    ("refine",  REASON_LLM_REFINE_FAILED),
+    ("llm",     REASON_LLM_REFINE_FAILED),
+    ("timeout", REASON_LLM_REFINE_FAILED),
+    ("api",     REASON_LLM_REFINE_FAILED),
+]
+
+
+def _reason_from_exception(exc_text: str) -> str:
+    lower = exc_text.lower()
+    for keyword, code in _EXCEPTION_REASON_MAP:
+        if keyword in lower:
+            return code
+    return REASON_LLM_REFINE_FAILED
+
+
+def _reason_from_validation_msg(exception_msg: str) -> str:
+    lower = exception_msg.lower()
+    if "violates property constraints" in lower:
+        return REASON_ONTOLOGY_VIOLATION
+    if "not in candidate relations" in lower:
+        return REASON_PROPERTY_NOT_IN_ONTOLOGY
+    if "subject type not in candidate" in lower or "object type not in candidate" in lower:
+        return REASON_ENTITY_TYPE_NOT_FOUND
+    if "subject type" in lower or "object type" in lower:
+        return REASON_ENTITY_TYPE_NOT_FOUND
+    return REASON_PROPERTY_NOT_IN_ONTOLOGY
+
+
+class StructuredInferenceWithDB(BaseInferenceWithDB):
+    def __init__(
+        self,
+        extractor,
+        aligner,
+        triplets_db,
+        runtime_profile: RuntimeProfile = None,
+    ):
+        self.extractor = extractor
+        self.aligner = aligner
+        self.triplets_db = triplets_db
+        self.runtime_profile = runtime_profile or DEFAULT_RUNTIME_PROFILE
+        self._apply_language_prompt_overrides()
+
+        self.extract_triplets_with_ontology_filtering_tool = tool(
+            self.extract_triplets_with_ontology_filtering
+        )
+        self.extract_triplets_with_ontology_filtering_and_add_to_db_tool = tool(
+            self.extract_triplets_with_ontology_filtering_and_add_to_db
+        )
+        self.retrieve_similar_entity_names_tool = tool(
+            self.retrieve_similar_entity_names
+        )
+        self.identify_relevant_entities_from_question_tool = tool(
+            self.identify_relevant_entities_from_question_with_llm
+        )
+        self.get_1_hop_supporting_triplets_tool = tool(
+            self.get_1_hop_supporting_triplets
+        )
+        self.answer_question_with_llm_tool = tool(self.answer_question_with_llm)
+
+    def _apply_language_prompt_overrides(self) -> None:
+        if self.runtime_profile.ontology_language != "tr":
+            return
+        if not hasattr(self.extractor, "prompts"):
+            return
+        if getattr(self.extractor, "_wikontic_tr_prompt_overrides_applied", False):
+            return
+
+        tr_extraction_instruction = """
+
+### Turkish ontology mode
+The ontology labels and aliases are Turkish. For Turkish input text, output
+"relation", "subject_type", and "object_type" using Turkish ontology-style
+labels whenever possible. Keep named entities as they appear in the text. Do
+not translate Turkish factual objects into English when the object is a common
+label, occupation, nationality, place type, or concept.
+
+Examples of preferred Turkish labels:
+- human -> insan
+- city -> şehir
+- writer -> yazar
+- profession -> meslek
+- place of birth -> doğum yeri
+- country/nationality/citizenship should use the closest Turkish wording
+  supported by the sentence.
+"""
+
+        tr_candidate_instruction = """
+
+### Turkish ontology mode
+Candidate labels come from a Turkish ontology. Select exact candidate strings
+from the provided candidate list/triplets. Do not invent English labels when
+Turkish candidates are present. Return only valid JSON.
+"""
+
+        prompt_suffixes = {
+            "triplet_extraction": tr_extraction_instruction,
+            "relation_entity_types_ranker": tr_candidate_instruction,
+            "relation_ranker": tr_candidate_instruction,
+            "entity_types_ranker": tr_candidate_instruction,
+            "relation_ranker_wo_entity_types": tr_candidate_instruction,
+            "subject_ranker": tr_candidate_instruction,
+            "object_ranker": tr_candidate_instruction,
+            "quailfier_object_ranker": tr_candidate_instruction,
+        }
+        for key, suffix in prompt_suffixes.items():
+            if key in self.extractor.prompts and suffix not in self.extractor.prompts[key]:
+                self.extractor.prompts[key] += suffix
+
+        self.extractor._wikontic_tr_prompt_overrides_applied = True
+
+    def _normalize_entity_name(self, name: str) -> str:
+        # TR modunda diakritikleri korur; diğer dillerde mevcut unidecode davranışı.
+        if getattr(self.runtime_profile, "ontology_language", None) == "tr":
+            return name
+        return unidecode(name)
+
+    def _sanitize_refine_output(self, raw_output, is_object: bool = False) -> str:
+        """
+        LLM bazen `refine_entity` cevabını tırnakla sarıyor ya da prompt'taki JSON
+        yapısını taklit ediyor (`{"subject": "..."}`, `["..."]`). Bu helper en iyi
+        çabayla düz bir entity ismi çıkarır; çıkaramazsa boş string döner ve
+        çağıran taraf orijinal isme fallback eder.
+        """
+        if raw_output is None:
+            return ""
+        if not isinstance(raw_output, str):
+            try:
+                raw_output = str(raw_output)
+            except Exception:
+                return ""
+
+        text = raw_output.strip()
+        if not text:
+            return ""
+
+        if text[0] in "{[":
+            try:
+                parsed = json.loads(text)
+            except (ValueError, TypeError):
+                parsed = None
+
+            if isinstance(parsed, dict):
+                preferred_key = "object" if is_object else "subject"
+                picked = ""
+                for k in (preferred_key, "entity", "name", "label"):
+                    val = parsed.get(k)
+                    if isinstance(val, str) and val.strip():
+                        picked = val
+                        break
+                if not picked:
+                    return ""
+                text = picked.strip()
+            elif isinstance(parsed, list):
+                if parsed and isinstance(parsed[0], str):
+                    text = parsed[0].strip()
+                else:
+                    return ""
+            elif parsed is None:
+                pass
+            else:
+                return ""
+
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+            text = text[1:-1].strip()
+
+        return text
+
+    def _get_model_name(self) -> str:
+        for attr in ("model_name", "model", "llm_model", "model_id"):
+            val = getattr(self.extractor, attr, None)
+            if val and isinstance(val, str):
+                return val
+        return "unknown"
+
+    def _refine_entity_types(self, text, triplet, run_id=None):
+        set_llm_context(run_id, "refine_entity_types")
+
+        candidate_subj_type_ids, candidate_obj_type_ids = (
+            self.aligner.retrieve_similar_entity_types(triplet=triplet)
+        )
+
+        candidate_entity_type_id_2_label = self.aligner.retrieve_entity_type_labels(
+            candidate_subj_type_ids + candidate_obj_type_ids
+        )
+
+        candidate_subject_types = [
+            candidate_entity_type_id_2_label[t] for t in candidate_subj_type_ids
+        ]
+        candidate_object_types = [
+            candidate_entity_type_id_2_label[t] for t in candidate_obj_type_ids
+        ]
+
+        resolved_subject_type, resolved_subject_type_id = (
+            self.aligner.resolve_entity_type_candidate(
+                triplet["subject_type"],
+                candidate_subj_type_ids,
+                candidate_entity_type_id_2_label,
+            )
+        )
+        resolved_object_type, resolved_object_type_id = (
+            self.aligner.resolve_entity_type_candidate(
+                triplet["object_type"],
+                candidate_obj_type_ids,
+                candidate_entity_type_id_2_label,
+            )
+        )
+
+        if resolved_subject_type_id and resolved_object_type_id:
+            refined_subject_type = resolved_subject_type
+            refined_object_type  = resolved_object_type
+            refined_subject_type_id = resolved_subject_type_id
+            refined_object_type_id  = resolved_object_type_id
+        else:
+            prompt_triplet = triplet.copy()
+            if resolved_subject_type_id:
+                candidate_subject_types = [resolved_subject_type]
+                prompt_triplet["subject_type"] = resolved_subject_type
+            elif triplet["subject_type"] in candidate_subject_types:
+                candidate_subject_types = [triplet["subject_type"]]
+
+            if resolved_object_type_id:
+                candidate_object_types = [resolved_object_type]
+                prompt_triplet["object_type"] = resolved_object_type
+            elif triplet["object_type"] in candidate_object_types:
+                candidate_object_types = [triplet["object_type"]]
+
+            self.extractor.reset_error_state()
+            refined_entity_types = self.extractor.refine_entity_types(
+                text=text,
+                triplet=prompt_triplet,
+                candidate_subject_types=candidate_subject_types,
+                candidate_object_types=candidate_object_types,
+            )
+
+            refined_subject_type, refined_subject_type_id = (
+                self.aligner.resolve_entity_type_candidate(
+                    refined_entity_types["subject_type"],
+                    candidate_subj_type_ids,
+                    candidate_entity_type_id_2_label,
+                )
+            )
+            refined_object_type, refined_object_type_id = (
+                self.aligner.resolve_entity_type_candidate(
+                    refined_entity_types["object_type"],
+                    candidate_obj_type_ids,
+                    candidate_entity_type_id_2_label,
+                )
+            )
+
+        return (
+            refined_subject_type,
+            refined_subject_type_id,
+            refined_object_type,
+            refined_object_type_id,
+        )
+
+    def _get_candidate_entity_properties(
+        self, triplet: Dict[str, str], subj_type_ids: List[str], obj_type_ids: List[str]
+    ) -> Tuple[List[Tuple[str, str]], Dict[str, dict]]:
+        """Retrieve candidate properties and their labels/constraints."""
+        properties: List[Tuple[str, str]] = (
+            self.aligner.retrieve_properties_for_entity_type(
+                target_relation=triplet["relation"],
+                object_types=obj_type_ids,
+                subject_types=subj_type_ids,
+                k=10,
+            )
+        )
+        prop_2_label_and_constraint = (
+            self.aligner.retrieve_properties_labels_and_constraints(
+                property_id_list=[p[0] for p in properties]
+            )
+        )
+        return properties, prop_2_label_and_constraint
+
+    def _refine_relation(
+        self, text, triplet, refined_subject_type_id, refined_object_type_id, run_id=None
+    ):
+        """Refine relation using LLM."""
+        set_llm_context(run_id, "refine_relation")
+
+        if refined_subject_type_id and refined_object_type_id:
+            relation_direction_candidate_pairs, prop_2_label_and_constraint = (
+                self._get_candidate_entity_properties(
+                    triplet=triplet,
+                    subj_type_ids=[refined_subject_type_id],
+                    obj_type_ids=[refined_object_type_id],
+                )
+            )
+            candidate_relations = [
+                prop_2_label_and_constraint[p[0]]["label"]
+                for p in relation_direction_candidate_pairs
+            ]
+            if triplet["relation"] in candidate_relations:
+                refined_relation = triplet["relation"]
+            else:
+                self.extractor.reset_error_state()
+                refined_relation = self.extractor.refine_relation(
+                    text=text, triplet=triplet, candidate_relations=candidate_relations
+                )["relation"]
+        else:
+            refined_relation    = triplet["relation"]
+            candidate_relations = []
+
+        if refined_relation in candidate_relations:
+            refined_relation_id_candidates = [
+                p_id
+                for p_id in prop_2_label_and_constraint
+                if prop_2_label_and_constraint[p_id]["label"] == refined_relation
+            ]
+            refined_relation_id = refined_relation_id_candidates[0]
+            refined_relation_directions = [
+                p[1]
+                for p in relation_direction_candidate_pairs
+                if p[0] == refined_relation_id
+            ]
+            refined_relation_direction = (
+                "direct" if "direct" in refined_relation_directions else "inverse"
+            )
+            prop_subject_type_ids = [
+                prop_2_label_and_constraint[prop]["valid_subject_type_ids"]
+                for prop in prop_2_label_and_constraint
+                if prop_2_label_and_constraint[prop]["label"] == refined_relation
+            ][0]
+            prop_object_type_ids = [
+                prop_2_label_and_constraint[prop]["valid_object_type_ids"]
+                for prop in prop_2_label_and_constraint
+                if prop_2_label_and_constraint[prop]["label"] == refined_relation
+            ][0]
+        else:
+            refined_relation_direction = "direct"
+            refined_relation_id        = None
+            prop_subject_type_ids      = []
+            prop_object_type_ids       = []
+
+        return (
+            refined_relation,
+            refined_relation_id,
+            refined_relation_direction,
+            prop_subject_type_ids,
+            prop_object_type_ids,
+        )
+
+    def _retrieve_entity_type_hierarchy_by_id(self, entity_type_id: str) -> List[str]:
+        """Return type id plus parent ids, with a fallback for cached older aligners."""
+        hierarchy_fn = getattr(self.aligner, "retrieve_entity_type_hierarchy_by_id", None)
+        if callable(hierarchy_fn):
+            return hierarchy_fn(entity_type_id)
+
+        ontology_db = getattr(self.aligner, "ontology_db", None)
+        collection_name = getattr(self.aligner, "entity_type_collection_name", "entity_types")
+        if ontology_db is None:
+            raise AttributeError(
+                "Aligner object has no retrieve_entity_type_hierarchy_by_id method "
+                "and no ontology_db fallback"
+            )
+
+        collection = ontology_db.get_collection(collection_name)
+        entity_id_parent_types = collection.find_one(
+            {"entity_type_id": entity_type_id},
+            {"entity_type_id": 1, "parent_type_ids": 1, "_id": 0},
+        )
+        if not entity_id_parent_types:
+            return []
+        return [entity_id_parent_types["entity_type_id"]] + entity_id_parent_types.get(
+            "parent_type_ids", []
+        )
+
+    def _validate_backbone(
+        self,
+        refined_subject_type: str,
+        refined_object_type: str,
+        refined_relation: str,
+        refined_object_type_id: str,
+        refined_subject_type_id: str,
+        refined_relation_id: str,
+        valid_subject_type_ids: List[str],
+        valid_object_type_ids: List[str],
+    ):
+        """Check if the selected backbone_triplet's types and relation are in the valid sets."""
+        exception_msg = ""
+        if not refined_relation_id:
+            exception_msg += "Refined relation not in candidate relations\n"
+        if not refined_subject_type_id:
+            exception_msg += "Refined subject type not in candidate subject types\n"
+        if not refined_object_type_id:
+            exception_msg += "Refined object type not in candidate object types\n"
+
+        if exception_msg != "":
+            return False, exception_msg
+        else:
+            subject_type_hierarchy = self._retrieve_entity_type_hierarchy_by_id(
+                refined_subject_type_id
+            )
+            object_type_hierarchy = self._retrieve_entity_type_hierarchy_by_id(
+                refined_object_type_id
+            )
+
+            if valid_subject_type_ids == ["ANY"]:
+                valid_subject_type_ids = subject_type_hierarchy
+            if valid_object_type_ids == ["ANY"]:
+                valid_object_type_ids = object_type_hierarchy
+
+            if any(
+                [t in subject_type_hierarchy for t in valid_subject_type_ids]
+            ) and any([t in object_type_hierarchy for t in valid_object_type_ids]):
+                return True, exception_msg
+            else:
+                exception_msg += "Triplet backbone violates property constraints\n"
+                return False, exception_msg
+
+    def _refine_entity_name(self, text, triplet, sample_id, is_object=False, run_id=None):
+        """Refine entity names using type constraints."""
+        set_llm_context(run_id, "refine_entity_name")
+
+        self.extractor.reset_error_state()
+        if is_object:
+            entity = self._normalize_entity_name(triplet["object"])
+            entity_type = triplet["object_type"]
+            entity_hierarchy = self.aligner.retrieve_entity_type_hierarchy(entity_type)
+        else:
+            entity = self._normalize_entity_name(triplet["subject"])
+            entity_type = triplet["subject_type"]
+            entity_hierarchy = []
+
+        if any([t in ["Q186408", "Q309314"] for t in entity_hierarchy]):
+            updated_entity = entity
+        else:
+            similar_entities = self.aligner.retrieve_entity_by_type(
+                entity_name=entity, entity_type=entity_type, sample_id=sample_id
+            )
+            if len(similar_entities) > 0:
+                if entity in similar_entities:
+                    updated_entity = similar_entities[entity]
+                else:
+                    candidate_values = list(similar_entities.values())
+                    raw_output = self.extractor.refine_entity(
+                        text=text,
+                        triplet=triplet,
+                        candidates=candidate_values,
+                        is_object=is_object,
+                    )
+                    sanitized = self._sanitize_refine_output(
+                        raw_output, is_object=is_object
+                    )
+                    if sanitized:
+                        sanitized = self._normalize_entity_name(sanitized)
+
+                    # LLM kontratı: cevap ya adaylardan biri ya da "None" olmalı.
+                    # Sözleşme dışı her çıktı (boş, JSON kalıntısı, uyduruk isim)
+                    # orijinal entity'ye fallback eder.
+                    candidate_set = set(candidate_values)
+                    if (
+                        not sanitized
+                        or re.sub(r"[^\w\s]", "", sanitized) == "None"
+                        or sanitized not in candidate_set
+                    ):
+                        updated_entity = entity
+                    else:
+                        updated_entity = sanitized
+            else:
+                updated_entity = entity
+
+        self.aligner.add_entity(
+            entity_name=updated_entity,
+            alias=entity,
+            entity_type=entity_type,
+            sample_id=sample_id,
+        )
+
+        return updated_entity
+
+    def extract_triplets_with_ontology_filtering(
+        self, text, sample_id=None, source_text_id=None, run_id=None, timer=None
+    ):
+        """
+        Extract and refine knowledge graph triplets from text using LLM.
+
+        Args:
+            text (str):           Input text to extract triplets from
+            sample_id (str):      Sample ID
+            source_text_id (str): Optional source text identifier
+            run_id (str):         Optional run ID for trace logging
+            timer (StageTimer):   Optional shared timer from outer function
+        Returns:
+            tuple: (initial_triplets, final_triplets, filtered_triplets,
+                    ontology_filtered_triplets)
+        """
+        self.extractor.reset_tokens()
+        self.extractor.reset_messages()
+        self.extractor.reset_error_state()
+
+        # Split text upfront so each triplet can reference its source sentence.
+        sentences = split_sentences(text)
+
+        # ── Stage: llm_extract ────────────────────────────────────────────────
+        set_llm_context(run_id, "triplet_extraction")
+        if timer:
+            with timer.measure("llm_extract"):
+                extracted_triplets = self.extractor.extract_triplets_from_text(
+                    text, sentences=sentences
+                )
+            raw_response = getattr(self.extractor, "_last_response", None)
+            usage = getattr(raw_response, "usage", None) if raw_response else None
+            timer.record_token_usage(usage)
+        else:
+            extracted_triplets = self.extractor.extract_triplets_from_text(
+                text, sentences=sentences
+            )
+
+        # ── Artifact: raw_llm_output ──────────────────────────────────────────
+        if run_id:
+            try:
+                log_artifact(
+                    run_id,
+                    "raw_llm_output",
+                    {
+                        "text":   str(extracted_triplets),
+                        "type":   type(extracted_triplets).__name__,
+                        "format": "string",
+                    },
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger raw_llm_output failed: %s", log_exc)
+
+        # ── Stage: parse ──────────────────────────────────────────────────────
+        initial_triplets = []
+
+        def _parse():
+            raw_triplets = (
+                extracted_triplets.get("triplets", [])
+                if isinstance(extracted_triplets, dict) else []
+            )
+            # Fallback: if the LLM omitted or gave an invalid sentence_id, assign via word-overlap.
+            enriched = enrich_triplets_with_sentence_ids(raw_triplets, sentences)
+            for triplet in enriched:
+                triplet["prompt_token_num"], triplet["completion_token_num"] = (
+                    self.extractor.calculate_used_tokens()
+                )
+                triplet["source_text_id"] = source_text_id
+                triplet["sample_id"]      = sample_id
+                initial_triplets.append(triplet.copy())
+
+        if timer:
+            with timer.measure("parse"):
+                _parse()
+        else:
+            _parse()
+
+        # ── Artifact: parsed_triplets ─────────────────────────────────────────
+        if run_id:
+            try:
+                log_artifact(
+                    run_id,
+                    "parsed_triplets",
+                    {
+                        "triplets": [
+                            {
+                                "subject":      t.get("subject"),
+                                "relation":     t.get("relation"),
+                                "object":       t.get("object"),
+                                "subject_type": t.get("subject_type"),
+                                "object_type":  t.get("object_type"),
+                                "qualifiers":   t.get("qualifiers", []),
+                                "kaynak_cumle": t.get("kaynak_cumle"),
+                                "sentence_id":  t.get("sentence_id"),
+                            }
+                            for t in initial_triplets
+                        ],
+                        "count":     len(initial_triplets),
+                        "sentences": sentences,
+                    },
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger parsed_triplets failed: %s", log_exc)
+
+        final_triplets             = []
+        filtered_triplets          = []
+        ontology_filtered_triplets = []
+        entity_merge_log           = []
+        self._last_entity_merge_log = entity_merge_log
+
+        # ── Stage: ontology_alignment ─────────────────────────────────────────
+        def _process_triplets():
+            for triplet in (initial_triplets if initial_triplets else []):
+                self.extractor.reset_tokens()
+                # Preserve sentence_id before refinement mutates the triplet dict.
+                sentence_id = triplet.get("sentence_id")
+
+                try:
+                    logger.log(logging.DEBUG, "Triplet: %s\n%s" % (str(triplet), "-" * 100))
+
+                    (
+                        refined_subject_type,
+                        refined_subject_type_id,
+                        refined_object_type,
+                        refined_object_type_id,
+                    ) = self._refine_entity_types(
+                        text=text, triplet=triplet, run_id=run_id
+                    )
+
+                    (
+                        refined_relation,
+                        refined_relation_id,
+                        refined_relation_direction,
+                        prop_subject_type_ids,
+                        prop_object_type_ids,
+                    ) = self._refine_relation(
+                        text=text,
+                        triplet=triplet,
+                        refined_subject_type_id=refined_subject_type_id,
+                        refined_object_type_id=refined_object_type_id,
+                        run_id=run_id,
+                    )
+
+                    if refined_relation_direction == "inverse":
+                        refined_subject_type_id, refined_object_type_id = (
+                            refined_object_type_id,
+                            refined_subject_type_id,
+                        )
+
+                    backbone_triplet = {
+                        "subject": (
+                            triplet["subject"]
+                            if refined_relation_direction == "direct"
+                            else triplet["object"]
+                        ),
+                        "relation": refined_relation,
+                        "object": (
+                            triplet["object"]
+                            if refined_relation_direction == "direct"
+                            else triplet["subject"]
+                        ),
+                        "subject_type": (
+                            refined_subject_type
+                            if refined_relation_direction == "direct"
+                            else refined_object_type
+                        ),
+                        "object_type": (
+                            refined_object_type
+                            if refined_relation_direction == "direct"
+                            else refined_subject_type
+                        ),
+                        "sentence_id": sentence_id,
+                    }
+
+                    backbone_triplet["qualifiers"] = triplet["qualifiers"]
+
+                    # ── Entity name refinement + merge log ────────────────────
+                    original_subject = backbone_triplet["subject"]
+                    original_object  = backbone_triplet["object"]
+
+                    if refined_subject_type_id:
+                        backbone_triplet["subject"] = self._refine_entity_name(
+                            text, backbone_triplet, sample_id,
+                            is_object=False, run_id=run_id
+                        )
+                        if backbone_triplet["subject"] != original_subject:
+                            entity_merge_log.append({
+                                "from":        original_subject,
+                                "to":          backbone_triplet["subject"],
+                                "entity_type": backbone_triplet["subject_type"],
+                                "method":      "vectorSearch+LLM",
+                            })
+
+                    if refined_object_type_id:
+                        backbone_triplet["object"] = self._refine_entity_name(
+                            text, backbone_triplet, sample_id,
+                            is_object=True, run_id=run_id
+                        )
+                        if backbone_triplet["object"] != original_object:
+                            entity_merge_log.append({
+                                "from":        original_object,
+                                "to":          backbone_triplet["object"],
+                                "entity_type": backbone_triplet["object_type"],
+                                "method":      "vectorSearch+LLM",
+                            })
+
+                    (
+                        backbone_triplet["prompt_token_num"],
+                        backbone_triplet["completion_token_num"],
+                    ) = self.extractor.calculate_used_tokens()
+                    backbone_triplet["source_text_id"] = source_text_id
+                    backbone_triplet["sample_id"]      = sample_id
+
+                    backbone_triplet_valid, backbone_triplet_exception_msg = (
+                        self._validate_backbone(
+                            backbone_triplet["subject_type"],
+                            backbone_triplet["object_type"],
+                            backbone_triplet["relation"],
+                            refined_object_type_id,
+                            refined_subject_type_id,
+                            refined_relation_id,
+                            prop_subject_type_ids,
+                            prop_object_type_ids,
+                        )
+                    )
+
+                    if backbone_triplet_valid:
+                        final_triplets.append(backbone_triplet.copy())
+                        logger.log(
+                            logging.DEBUG,
+                            "Final triplet: %s\n%s" % (str(backbone_triplet), "-" * 100),
+                        )
+                    else:
+                        reason_code = _reason_from_validation_msg(backbone_triplet_exception_msg)
+                        backbone_triplet["exception_text"] = backbone_triplet_exception_msg
+                        backbone_triplet["reason_code"]    = reason_code
+                        logger.log(
+                            logging.ERROR,
+                            "Ontology filtered [%s]: %s\n%s"
+                            % (reason_code, str(backbone_triplet), "-" * 100),
+                        )
+                        ontology_filtered_triplets.append(backbone_triplet.copy())
+
+                except Exception as e:
+                    reason_code      = _reason_from_exception(str(e))
+                    backbone_triplet = triplet.copy()
+                    (
+                        backbone_triplet["prompt_token_num"],
+                        backbone_triplet["completion_token_num"],
+                    ) = self.extractor.calculate_used_tokens()
+                    backbone_triplet["source_text_id"] = source_text_id
+                    backbone_triplet["sample_id"]      = sample_id
+                    backbone_triplet["exception_text"] = str(e)
+                    backbone_triplet["reason_code"]    = reason_code
+                    backbone_triplet["sentence_id"]    = sentence_id
+                    filtered_triplets.append(backbone_triplet.copy())
+                    logger.log(
+                        logging.INFO,
+                        "Filtered [%s]: %s\n%s" % (reason_code, str(backbone_triplet), "-" * 100),
+                    )
+
+        if timer:
+            with timer.measure("ontology_alignment"):
+                _process_triplets()
+        else:
+            _process_triplets()
+
+        # ── Artifact: filtered_out ────────────────────────────────────────────
+        if run_id:
+            try:
+                all_filtered = []
+                for t in filtered_triplets:
+                    all_filtered.append({
+                        "subject":        t.get("subject"),
+                        "relation":       t.get("relation"),
+                        "object":         t.get("object"),
+                        "reason_code":    t.get("reason_code", REASON_LLM_REFINE_FAILED),
+                        "exception_text": t.get("exception_text", ""),
+                        "filter_stage":   "pipeline_exception",
+                        "sentence_id":    t.get("sentence_id"),
+                    })
+                for t in ontology_filtered_triplets:
+                    all_filtered.append({
+                        "subject":        t.get("subject"),
+                        "relation":       t.get("relation"),
+                        "object":         t.get("object"),
+                        "reason_code":    t.get("reason_code", REASON_ONTOLOGY_VIOLATION),
+                        "exception_text": t.get("exception_text", ""),
+                        "filter_stage":   "ontology_validation",
+                        "sentence_id":    t.get("sentence_id"),
+                    })
+                log_artifact(
+                    run_id,
+                    "filtered_out",
+                    {
+                        "triplets":                 all_filtered,
+                        "count":                    len(all_filtered),
+                        "pipeline_exception_count": len(filtered_triplets),
+                        "ontology_filtered_count":  len(ontology_filtered_triplets),
+                        "sentences":                sentences,
+                    },
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger filtered_out failed: %s", log_exc)
+
+        # ── Artifact: merge_map_entities ──────────────────────────────────────
+        if run_id:
+            try:
+                log_artifact(
+                    run_id,
+                    "merge_map_entities",
+                    {
+                        "merges": entity_merge_log,
+                        "count":  len(entity_merge_log),
+                    },
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger merge_map_entities failed: %s", log_exc)
+
+        # ── Artifact: final_triplets ──────────────────────────────────────────
+        if run_id:
+            try:
+                log_artifact(
+                    run_id,
+                    "final_triplets",
+                    {
+                        "triplets": [
+                            {
+                                "subject":      t.get("subject"),
+                                "relation":     t.get("relation"),
+                                "object":       t.get("object"),
+                                "subject_type": t.get("subject_type"),
+                                "object_type":  t.get("object_type"),
+                                "sentence_id":  t.get("sentence_id"),
+                            }
+                            for t in final_triplets
+                        ],
+                        "count":                   len(final_triplets),
+                        "filtered_count":          len(filtered_triplets),
+                        "ontology_filtered_count": len(ontology_filtered_triplets),
+                        "sentences":               sentences,
+                    },
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger final_triplets failed: %s", log_exc)
+
+        return (
+            initial_triplets,
+            final_triplets,
+            filtered_triplets,
+            ontology_filtered_triplets,
+        )
+
+    def extract_triplets_with_ontology_filtering_and_add_to_db(
+        self, text, sample_id=None, source_text_id=None, extra_config=None
+    ):
+        """
+        Extract and refine knowledge graph triplets from text using LLM,
+        then add them to the database.
+
+        Args:
+            text (str):           Input text to extract triplets from
+            sample_id (str):      Sample ID
+            source_text_id (str): Optional source text identifier
+        Returns:
+            tuple: (initial_triplets, final_triplets, filtered_triplets,
+                    ontology_filtered_triplets, run_id)
+        """
+        model_name = self._get_model_name()
+        prompt_type = getattr(self.extractor, "prompt_type", None)
+        run_extra_config = {
+            "source_text_id": source_text_id,
+            "prompt_type": prompt_type,
+        }
+        if extra_config:
+            run_extra_config.update(extra_config)
+
+        run_id = start_run(
+            sample_id=str(sample_id) if sample_id is not None else "unknown",
+            model=model_name,
+            input_text=text,
+            extra_config=run_extra_config,
+            runtime_profile=self.runtime_profile,
+            db_name=self.runtime_profile.triplets_db_name,
+        )
+        self._last_run_id = run_id
+
+        # Propagate profile context to LLM audit log for all stages in this run
+        set_llm_context(
+            run_id=run_id,
+            stage=None,
+            profile_id=self.runtime_profile.profile_id,
+            ontology_profile_id=self.runtime_profile.ontology_profile_id,
+            embedding_profile_id=self.runtime_profile.embedding_profile_id,
+            ontology_db_name=self.runtime_profile.ontology_db_name,
+            triplets_db_name=self.runtime_profile.triplets_db_name,
+            ontology_language=self.runtime_profile.ontology_language,
+            embedding_model_name=self.runtime_profile.embedding_model_name,
+            embedding_dimension=self.runtime_profile.embedding_dimension,
+        )
+
+        timer = StageTimer()
+
+        try:
+            (
+                initial_triplets,
+                final_triplets,
+                filtered_triplets,
+                ontology_filtered_triplets,
+            ) = self.extract_triplets_with_ontology_filtering(
+                text,
+                sample_id=sample_id,
+                source_text_id=source_text_id,
+                run_id=run_id,
+                timer=timer,
+            )
+
+            # ── Stage: db_write ───────────────────────────────────────────────
+            db_write_results = {
+                "initial_triplets": {
+                    "attempted_count": 0,
+                    "inserted_count": 0,
+                    "already_existing_count": 0,
+                },
+                "final_triplets": {
+                    "attempted_count": 0,
+                    "inserted_count": 0,
+                    "already_existing_count": 0,
+                },
+                "filtered_triplets": {
+                    "attempted_count": 0,
+                    "inserted_count": 0,
+                    "already_existing_count": 0,
+                },
+                "ontology_filtered_triplets": {
+                    "attempted_count": 0,
+                    "inserted_count": 0,
+                    "already_existing_count": 0,
+                },
+            }
+            with timer.measure("db_write"):
+                if len(initial_triplets) > 0:
+                    db_write_results["initial_triplets"] = self.aligner.add_initial_triplets(
+                        initial_triplets, sample_id=sample_id
+                    )
+                if len(final_triplets) > 0:
+                    db_write_results["final_triplets"] = self.aligner.add_triplets(
+                        final_triplets, sample_id=sample_id
+                    )
+                if len(filtered_triplets) > 0:
+                    db_write_results["filtered_triplets"] = self.aligner.add_filtered_triplets(
+                        filtered_triplets, sample_id=sample_id
+                    )
+                if len(ontology_filtered_triplets) > 0:
+                    db_write_results["ontology_filtered_triplets"] = self.aligner.add_ontology_filtered_triplets(
+                        ontology_filtered_triplets, sample_id=sample_id
+                    )
+
+            stats = timer.to_stats()
+            stats.update({
+                "initial_count":           len(initial_triplets),
+                "final_count":             len(final_triplets),
+                "filtered_count":          len(filtered_triplets),
+                "ontology_filtered_count": len(ontology_filtered_triplets),
+                "kg_inserted_count": db_write_results["final_triplets"].get("inserted_count", 0),
+                "kg_already_existing_count": db_write_results["final_triplets"].get("already_existing_count", 0),
+                "db_write_results": db_write_results,
+            })
+
+            try:
+                paper_report = build_paper_report(
+                    run_id=run_id,
+                    sample_id=str(sample_id) if sample_id is not None else "unknown",
+                    model=model_name,
+                    prompt_type=prompt_type,
+                    runtime_profile=self.runtime_profile,
+                    input_text=text,
+                    initial_triplets=initial_triplets,
+                    final_triplets=final_triplets,
+                    filtered_triplets=filtered_triplets,
+                    ontology_filtered_triplets=ontology_filtered_triplets,
+                    entity_merges=getattr(self, "_last_entity_merge_log", []),
+                    db_write_results=db_write_results,
+                    stats=stats,
+                    extra_config=run_extra_config,
+                )
+                log_artifact(
+                    run_id,
+                    "paper_report",
+                    paper_report,
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger paper_report failed: %s", log_exc)
+
+            finish_run(
+                run_id=run_id,
+                status="DONE",
+                stats=stats,
+                db_name=self.runtime_profile.triplets_db_name,
+            )
+
+        except Exception as e:
+            timer.mark_failed_at("unknown")
+            try:
+                log_artifact(
+                    run_id,
+                    "failure_report",
+                    {
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "sample_id": str(sample_id) if sample_id is not None else "unknown",
+                        "source_text_id": source_text_id,
+                        "extra_config": run_extra_config,
+                        "stats": timer.to_stats(),
+                    },
+                    db_name=self.runtime_profile.triplets_db_name,
+                    profile_id=self.runtime_profile.profile_id,
+                    runtime_profile=self.runtime_profile,
+                )
+            except Exception as log_exc:
+                logger.warning("run_logger failure_report failed: %s", log_exc)
+            finish_run(
+                run_id=run_id,
+                status="FAILED",
+                error=str(e),
+                stats=timer.to_stats(),
+                db_name=self.runtime_profile.triplets_db_name,
+            )
+            raise
+
+        return (
+            initial_triplets,
+            final_triplets,
+            filtered_triplets,
+            ontology_filtered_triplets,
+            run_id,
+        )

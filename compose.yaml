@@ -1,0 +1,87 @@
+name: knowledge-graph-production
+
+services:
+  frontend:
+    build:
+      context: ./Frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    environment:
+      API_UPSTREAM: ${API_UPSTREAM:-http://backend:8000}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: ./Backend/gateway
+    restart: unless-stopped
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LLM_BASE_ADDRESS: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      WIKONTIC_URL: http://wikontic:8001
+      WIKONTIC_TIMEOUT_SECONDS: ${WIKONTIC_TIMEOUT_SECONDS:-170}
+    depends_on:
+      wikontic:
+        condition: service_healthy
+
+  wikontic:
+    build:
+      context: ./Backend/wikontic
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    environment:
+      MONGO_URI: mongodb://wikontic-mongo:27017/?directConnection=true
+      KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENAI_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      PROXY_URL: ${PROXY_URL:-}
+      HF_HOME: /models/huggingface
+      LLM_LOG_LEVEL: ${LLM_LOG_LEVEL:-preview}
+      LLM_LOG_PATH: /app/logs/llm_requests.jsonl
+    volumes:
+      - wikontic_models:/models
+      - wikontic_logs:/app/logs
+    depends_on:
+      wikontic-mongo:
+        condition: service_healthy
+
+  wikontic-init:
+    profiles: ["setup"]
+    build:
+      context: ./Backend/wikontic
+      dockerfile: Dockerfile.api
+    environment:
+      MONGO_URI: mongodb://wikontic-mongo:27017/?directConnection=true
+      WIKONTIC_PROFILES: ${WIKONTIC_PROFILES:-en__contriever}
+      HF_HOME: /models/huggingface
+    volumes:
+      - wikontic_models:/models
+    depends_on:
+      wikontic-mongo:
+        condition: service_healthy
+    command: ["python", "scripts/init_profiles.py"]
+    restart: "no"
+
+  wikontic-mongo:
+    image: mongodb/mongodb-atlas-local:8.0
+    restart: unless-stopped
+    ports:
+      - "${WIKONTIC_MONGO_PORT:-27018}:27017"
+    volumes:
+      - wikontic_mongo_data:/data/db
+      - wikontic_mongo_config:/data/configdb
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'quit(db.runCommand({ ping: 1 }).ok ? 0 : 2)' mongodb://127.0.0.1:27017/admin"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+
+volumes:
+  wikontic_mongo_data:
+  wikontic_mongo_config:
+  wikontic_models:
+  wikontic_logs:
