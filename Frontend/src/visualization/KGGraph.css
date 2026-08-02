@@ -1,0 +1,62 @@
+/* ── KGGraph wrapper (flex child — fills card body) ── */
+.kg-wrapper {
+  flex: 1;
+  position: relative;
+  min-height: 200px;
+}
+
+/* ── KGGraph iframe — absolute fill ── */
+.kg-frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 4px;
+  display: block;
+}
+
+/* ── State placeholder (loading / error / empty) ── */
+.kg-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+}
+
+/* ── Loading dots (Wikontic-style pulse) ── */
+.kg-loading {
+  display: flex;
+  gap: 6px;
+}
+
+.kg-loading span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(27, 68, 216, 0.35);
+  animation: kg-pulse 1.2s ease-in-out infinite;
+}
+.kg-loading span:nth-child(2) { animation-delay: 0.2s; }
+.kg-loading span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes kg-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.85); }
+  50%       { opacity: 1;    transform: scale(1); }
+}
+
+/* ── Hint text ── */
+.kg-hint {
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  color: #888888;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.kg-hint--error {
+  color: #c0392b;
+}

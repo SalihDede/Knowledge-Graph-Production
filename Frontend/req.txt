@@ -1,0 +1,27 @@
+UI Frontend - Gereksinimler
+
+Sistem:
+- Node.js >= 18
+- npm veya pnpm
+
+Bağımlılıklar (package.json'dan):
+- d3-force @ ^3.0.0
+- react @ ^19.2.4
+- react-dom @ ^19.2.4
+
+Geliştirme bağımlılıkları (opsiyonel, development/build):
+- vite @ ^6.4.2
+- @vitejs/plugin-react @ ^4.7.0
+- eslint, @eslint/js, eslint-plugin-react-hooks, eslint-plugin-react-refresh, globals
+- @types/d3-force, @types/react, @types/react-dom (type desteği için)
+
+Hızlı kullanım:
+1) Bağımlılıkları yükle:
+   npm install
+   (veya `pnpm install`)
+2) Geliştirme sunucusunu başlat:
+   npm run dev
+3) Üretim için derle:
+   npm run build
+
+Not: Eğer proje farklı bir Node versiyonunda çalışıyorsa `nvm` veya `.nvmrc` kullanmayı tercih edin.

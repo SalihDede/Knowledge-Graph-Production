@@ -1,0 +1,53 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Manrope:wght@700;800&display=swap');
+
+:root {
+  --surface: #edf7f4;
+  --surface-panel: #e6f0ed;
+  --surface-card: #ffffff;
+  --surface-raised: #f8fbfa;
+  --surface-tint: #dff3ee;
+  --text: #101918;
+  --muted: #5d6d69;
+  --muted-strong: #32413e;
+  --primary: #24decb;
+  --secondary: #006f63;
+  --secondary-strong: #04564e;
+  --tertiary: #f4c94d;
+  --blue: #1f5eb8;
+  --danger: #b42318;
+  --border: rgba(16, 25, 24, 0.12);
+  --border-strong: rgba(0, 111, 99, 0.24);
+  --ambient-shadow: 0 18px 48px rgba(16, 25, 24, 0.08);
+  --deep-shadow: 0 24px 70px rgba(16, 25, 24, 0.16);
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--surface);
+  color: var(--text);
+  font-family: 'Inter', sans-serif;
+  min-height: 100vh;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--secondary);
+  outline-offset: 3px;
+}
