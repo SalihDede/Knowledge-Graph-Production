@@ -18,6 +18,24 @@ class JobStatus(str, enum.Enum):
     failed = "failed"
 
 
+class DocumentSourceType(str, enum.Enum):
+    text = "text"
+    pdf = "pdf"
+    url = "url"
+
+
+class IngestionStatus(str, enum.Enum):
+    pending = "pending"
+    processing = "processing"
+    ready = "ready"
+    failed = "failed"
+
+
+class SegmentType(str, enum.Enum):
+    page = "page"
+    paragraph = "paragraph"
+
+
 class Workspace(Base):
     __tablename__ = "workspaces"
     __table_args__ = (
@@ -56,6 +74,8 @@ class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
         Index("ix_documents_workspace_id", "workspace_id"),
+        # NULL content_hash rows (pdf/url docs still ingesting) never collide:
+        # both PostgreSQL and SQLite treat NULLs as distinct in unique indexes.
         Index("ux_documents_workspace_content_hash", "workspace_id", "content_hash", unique=True),
     )
 
@@ -70,10 +90,27 @@ class Document(Base):
         Uuid, ForeignKey("anonymous_visitors.id", ondelete="SET NULL"), nullable=True
     )
     title: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    raw_text: Mapped[str] = mapped_column(Text, nullable=False)
-    normalized_text: Mapped[str] = mapped_column(Text, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    char_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_type: Mapped[DocumentSourceType] = mapped_column(
+        Enum(DocumentSourceType, name="document_source_type", native_enum=False, length=20),
+        default=DocumentSourceType.text,
+        nullable=False,
+    )
+    ingestion_status: Mapped[IngestionStatus] = mapped_column(
+        Enum(IngestionStatus, name="document_ingestion_status", native_enum=False, length=20),
+        default=IngestionStatus.ready,
+        nullable=False,
+    )
+    ingestion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    storage_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Populated once ingestion completes (always for text; after extraction
+    # for pdf/url), so these stay nullable while a document is still pending.
+    raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    normalized_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    char_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
@@ -131,3 +168,35 @@ class ExtractionJob(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
+
+
+class DocumentSegment(Base):
+    __tablename__ = "document_segments"
+    __table_args__ = (
+        Index("ix_document_segments_document_id", "document_id"),
+        Index(
+            "ux_document_segments_document_ordinal",
+            "document_id",
+            "segment_type",
+            "ordinal",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    segment_type: Mapped[SegmentType] = mapped_column(
+        Enum(SegmentType, name="document_segment_type", native_enum=False, length=20),
+        nullable=False,
+    )
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    char_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Mapped attribute avoids shadowing SQLAlchemy's reserved `Base.metadata`;
+    # the actual column is still named "metadata".
+    segment_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

@@ -7,6 +7,28 @@ function formatTimestamp(iso) {
   return date.toLocaleString()
 }
 
+function getUrlHost(url) {
+  try {
+    return new URL(url).host
+  } catch {
+    return url
+  }
+}
+
+function getSourceBadge(job, copy) {
+  if (job.document_source_type === 'pdf') {
+    return job.document_page_count
+      ? `${copy.sourcePdf} · ${job.document_page_count} ${copy.pageUnit}`
+      : copy.sourcePdf
+  }
+  if (job.document_source_type === 'url') {
+    return job.document_source_url
+      ? `${copy.sourceUrl} · ${getUrlHost(job.document_source_url)}`
+      : copy.sourceUrl
+  }
+  return null
+}
+
 export default function HistoryPanel({ jobs, loading, error, onSelectJob, onRefresh, t }) {
   const fallbackText = getUiText('tr')
   const copy = t?.historyPanel ?? fallbackText.historyPanel
@@ -61,6 +83,9 @@ export default function HistoryPanel({ jobs, loading, error, onSelectJob, onRefr
                 </div>
                 <p className="history-panel-preview">{job.document_preview}</p>
                 <div className="history-panel-meta">
+                  {getSourceBadge(job, copy) && (
+                    <span className="history-panel-source-badge">{getSourceBadge(job, copy)}</span>
+                  )}
                   <span>{job.model}</span>
                   <span>{job.triple_count} {copy.tripleUnit}</span>
                   <span>{formatTimestamp(job.completed_at || job.created_at)}</span>

@@ -5,6 +5,7 @@
 **/.vite/
 **/__pycache__/
 **/.pytest_cache/
+Backend/gateway/logs/
 
 # Import sources are kept locally as references. Active copies live under
 # Frontend/ and Backend/.

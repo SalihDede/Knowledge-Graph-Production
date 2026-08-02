@@ -21,16 +21,28 @@ import {
   computeDurationMs,
   createDocument,
   createExtractionJob,
+  createPdfDocument,
+  createUrlDocument,
   getDocument,
+  getDocumentIngestion,
   getExtractionJob,
   getJobTriples,
   listExtractionJobs,
   mapTriplesToLegacyFormat,
+  presignUpload,
   updateTripleStatus,
+  uploadFileToPresignedUrl,
 } from './api/extraction'
 import { addActiveJob, loadActiveJobs, removeActiveJob } from './api/activeJobsStorage'
 
 const POLL_INTERVAL_MS = 2500
+const INGESTION_POLL_INTERVAL_MS = 2000
+
+const SOURCE_TYPE_OPTIONS = [
+  { id: 'text', label: 'Metin' },
+  { id: 'pdf', label: 'PDF' },
+  { id: 'url', label: 'URL' },
+]
 
 const GROUPS = [
   {
@@ -389,7 +401,19 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(true)
   const [historyError, setHistoryError] = useState(null)
   const [reviewCardId, setReviewCardId] = useState(null)
+  const [sourceType, setSourceType] = useState('text')
+  const [pdfFile, setPdfFile] = useState(null)
+  const [urlInput, setUrlInput] = useState('')
+  const [uploadProgress, setUploadProgress] = useState(0)
+  const [ingesting, setIngesting] = useState(false)
+  const [ingestionDocId, setIngestionDocId] = useState(null)
+  const [ingestionStatus, setIngestionStatus] = useState(null)
+  const [ingestionError, setIngestionError] = useState(null)
+  const [ingestionMeta, setIngestionMeta] = useState(null)
   const referenceInputRef = useRef(null)
+  const pdfInputRef = useRef(null)
+  const ingestionPollRef = useRef(null)
+  const handleAddSlotRef = useRef(null)
   const wiconticSettingsRef = useRef(null)
   const previousKgRef = useRef(selectedKg)
   const cardsRef = useRef(cards)
@@ -810,6 +834,106 @@ function App() {
     setSelectedOntologyLanguage(language)
   }
 
+  function stopIngestionPolling() {
+    if (ingestionPollRef.current) {
+      clearInterval(ingestionPollRef.current)
+      ingestionPollRef.current = null
+    }
+  }
+
+  // Polls GET /api/documents/{id}/ingestion until the pending/processing PDF
+  // or URL document reaches ready/failed, then (on success) pulls the
+  // extracted text into the shared `text` state and auto-starts the first
+  // extraction job -- mirrors the existing extraction-job polling pattern
+  // (syncJobStatus) but for the ingestion stage that now precedes it.
+  function startIngestionPolling(documentId) {
+    stopIngestionPolling()
+    ingestionPollRef.current = setInterval(async () => {
+      try {
+        const { data: status } = await getDocumentIngestion(documentId)
+        setIngestionStatus(status.ingestion_status)
+        setIngestionMeta(status)
+
+        if (status.ingestion_status === 'ready') {
+          stopIngestionPolling()
+          setIngesting(false)
+          const { data: documentRecord } = await getDocument(documentId)
+          setText(documentRecord.normalized_text || '')
+          setSubmitted(true)
+          handleAddSlotRef.current?.()
+        } else if (status.ingestion_status === 'failed') {
+          stopIngestionPolling()
+          setIngesting(false)
+          setIngestionError(status.ingestion_error || 'İşleme başarısız oldu.')
+        }
+      } catch {
+        // Transient polling failure; the next tick retries automatically.
+      }
+    }, INGESTION_POLL_INTERVAL_MS)
+  }
+
+  useEffect(() => stopIngestionPolling, [])
+
+  function handleSourceTypeChange(nextType) {
+    setSourceType(nextType)
+    setIngestionError(null)
+    setIngestionStatus(null)
+    setIngestionMeta(null)
+    setIngestionDocId(null)
+    setUploadProgress(0)
+    stopIngestionPolling()
+  }
+
+  function handlePdfFileChange(file) {
+    setPdfFile(file || null)
+    setIngestionError(null)
+  }
+
+  async function handleIngestPdf() {
+    if (!pdfFile || ingesting) return
+    setIngesting(true)
+    setIngestionError(null)
+    setUploadProgress(0)
+    try {
+      const { data: presigned } = await presignUpload(pdfFile.name, pdfFile.type || 'application/pdf')
+      await uploadFileToPresignedUrl(presigned.upload_url, pdfFile, {
+        onProgress: ratio => setUploadProgress(ratio),
+      })
+      const { data: document } = await createPdfDocument(presigned.storage_key, pdfFile.name)
+      setIngestionDocId(document.id)
+      setIngestionStatus(document.ingestion_status)
+      setIngestionMeta(document)
+      startIngestionPolling(document.id)
+    } catch (error) {
+      setIngesting(false)
+      setIngestionError(error.message || 'PDF işlenemedi.')
+    }
+  }
+
+  async function handleIngestUrl() {
+    if (!urlInput.trim() || ingesting) return
+    setIngesting(true)
+    setIngestionError(null)
+    try {
+      const { data: document } = await createUrlDocument(urlInput.trim())
+      setIngestionDocId(document.id)
+      setIngestionStatus(document.ingestion_status)
+      setIngestionMeta(document)
+      if (document.ingestion_status === 'ready') {
+        setIngesting(false)
+        const { data: documentRecord } = await getDocument(document.id)
+        setText(documentRecord.normalized_text || '')
+        setSubmitted(true)
+        handleAddSlotRef.current?.()
+      } else {
+        startIngestionPolling(document.id)
+      }
+    } catch (error) {
+      setIngesting(false)
+      setIngestionError(error.message || 'URL işlenemedi.')
+    }
+  }
+
   function handleAddSlot() {
     const embedding = selectedKg === 'wicontic'
       ? selectedEmbedding
@@ -822,6 +946,10 @@ function App() {
       ontologyLanguage: selectedKg === 'wicontic' ? selectedOntologyLanguage : null,
     })
   }
+
+  useEffect(() => {
+    handleAddSlotRef.current = handleAddSlot
+  })
 
   async function handleGraphSend(sel) {
     if (cards.length >= 3) return
@@ -1208,25 +1336,112 @@ function App() {
                 <span className="input-mode">{currentSourceLabel}</span>
               </div>
             </div>
-            <div className="textarea-wrapper">
-              <label className="sr-only" htmlFor="research-text">{t.app.researchText}</label>
-              <textarea
-                id="research-text"
-                className="text-input"
-                value={text}
-                onChange={(e) => setText(e.target.value.slice(0, MAX))}
-                placeholder={t.app.textPlaceholder}
-                rows={6}
-                aria-describedby="research-text-help"
-              />
+            <div className="segmented-options source-type-toggle" role="group" aria-label="Kaynak türü">
+              {SOURCE_TYPE_OPTIONS.map(option => (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={`segmented-option ${sourceType === option.id ? 'active' : ''}`}
+                  onClick={() => handleSourceTypeChange(option.id)}
+                >
+                  {option.label}
+                </button>
+              ))}
             </div>
-            <div className="input-metrics">
-              <span className={`char-count ${text.length === MAX ? 'limit' : ''}`}>
-                {t.app.characters} <strong>{text.length}</strong> / {MAX}
-              </span>
-              <span>{t.app.tokens} <strong>{Math.ceil(text.trim().length / 4) || 0}</strong></span>
-              <span id="research-text-help">{t.app.readyForBenchmark}</span>
-            </div>
+
+            {sourceType === 'text' && (
+              <>
+                <div className="textarea-wrapper">
+                  <label className="sr-only" htmlFor="research-text">{t.app.researchText}</label>
+                  <textarea
+                    id="research-text"
+                    className="text-input"
+                    value={text}
+                    onChange={(e) => setText(e.target.value.slice(0, MAX))}
+                    placeholder={t.app.textPlaceholder}
+                    rows={6}
+                    aria-describedby="research-text-help"
+                  />
+                </div>
+                <div className="input-metrics">
+                  <span className={`char-count ${text.length === MAX ? 'limit' : ''}`}>
+                    {t.app.characters} <strong>{text.length}</strong> / {MAX}
+                  </span>
+                  <span>{t.app.tokens} <strong>{Math.ceil(text.trim().length / 4) || 0}</strong></span>
+                  <span id="research-text-help">{t.app.readyForBenchmark}</span>
+                </div>
+              </>
+            )}
+
+            {sourceType === 'pdf' && (
+              <div className="ingestion-panel">
+                <input
+                  ref={pdfInputRef}
+                  type="file"
+                  accept="application/pdf"
+                  className="sr-only"
+                  id="pdf-upload-input"
+                  onChange={e => handlePdfFileChange(e.target.files?.[0])}
+                />
+                <div className="ingestion-file-row">
+                  <button
+                    type="button"
+                    className="segmented-option"
+                    onClick={() => pdfInputRef.current?.click()}
+                    disabled={ingesting}
+                  >
+                    {pdfFile ? pdfFile.name : 'PDF seç'}
+                  </button>
+                  <button
+                    type="button"
+                    className="run-button"
+                    onClick={handleIngestPdf}
+                    disabled={!pdfFile || ingesting}
+                  >
+                    {ingesting ? 'Yükleniyor...' : 'Yükle ve İşle'}
+                  </button>
+                </div>
+                {ingesting && (
+                  <div className="upload-progress-track" role="progressbar" aria-valuenow={Math.round(uploadProgress * 100)} aria-valuemin={0} aria-valuemax={100}>
+                    <div className="upload-progress-fill" style={{ width: `${Math.round(uploadProgress * 100)}%` }} />
+                  </div>
+                )}
+                {ingestionDocId && ingestionStatus && (
+                  <p className="ingestion-status-hint">
+                    Durum: {ingestionStatus}
+                    {ingestionMeta?.page_count ? ` · ${ingestionMeta.page_count} sayfa` : ''}
+                  </p>
+                )}
+                {ingestionError && <p className="ingestion-status-error" role="alert">{ingestionError}</p>}
+              </div>
+            )}
+
+            {sourceType === 'url' && (
+              <div className="ingestion-panel">
+                <div className="ingestion-file-row">
+                  <input
+                    type="url"
+                    className="text-input url-input"
+                    value={urlInput}
+                    onChange={e => setUrlInput(e.target.value)}
+                    placeholder="https://example.com/makale"
+                    disabled={ingesting}
+                  />
+                  <button
+                    type="button"
+                    className="run-button"
+                    onClick={handleIngestUrl}
+                    disabled={!urlInput.trim() || ingesting}
+                  >
+                    {ingesting ? 'İşleniyor...' : 'İçe Aktar'}
+                  </button>
+                </div>
+                {ingestionDocId && ingestionStatus && (
+                  <p className="ingestion-status-hint">Durum: {ingestionStatus}</p>
+                )}
+                {ingestionError && <p className="ingestion-status-error" role="alert">{ingestionError}</p>}
+              </div>
+            )}
           </section>
         </div>
 

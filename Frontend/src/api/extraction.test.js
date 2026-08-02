@@ -4,13 +4,18 @@ import {
   computeDurationMs,
   createDocument,
   createExtractionJob,
+  createPdfDocument,
+  createUrlDocument,
   getDocument,
+  getDocumentIngestion,
   getExtractionJob,
   getJobTriples,
   listExtractionJobs,
   mapJobStatusToCardStatus,
   mapTriplesToLegacyFormat,
+  presignUpload,
   updateTripleStatus,
+  uploadFileToPresignedUrl,
 } from './extraction'
 
 function jsonResponse(body, { ok = true, status = 200, requestId = 'req_test123' } = {}) {
@@ -214,6 +219,118 @@ describe('API client', () => {
       method: 'PATCH',
       body: JSON.stringify({ status: 'verified' }),
     }))
+  })
+
+  it('presignUpload posts filename and content type, defaulting to application/pdf', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse({ upload_url: 'http://minio/x', storage_key: 'ws/x.pdf', expires_in_seconds: 600 }))
+
+    await presignUpload('doc.pdf')
+
+    expect(fetch).toHaveBeenCalledWith('/api/uploads/presign', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ filename: 'doc.pdf', content_type: 'application/pdf' }),
+    }))
+  })
+
+  it('createPdfDocument posts the storage key and optional title', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse({ id: 'doc-1', ingestion_status: 'pending' }))
+
+    await createPdfDocument('ws/x.pdf', 'My PDF')
+
+    expect(fetch).toHaveBeenCalledWith('/api/documents/pdf', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ storage_key: 'ws/x.pdf', title: 'My PDF' }),
+    }))
+  })
+
+  it('createUrlDocument posts the url and optional title', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse({ id: 'doc-2', ingestion_status: 'pending' }))
+
+    await createUrlDocument('http://example.com/a')
+
+    expect(fetch).toHaveBeenCalledWith('/api/documents/url', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ url: 'http://example.com/a' }),
+    }))
+  })
+
+  it('getDocumentIngestion hits the ingestion status endpoint', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse({ ingestion_status: 'ready' }))
+
+    await getDocumentIngestion('doc-1')
+
+    expect(fetch).toHaveBeenCalledWith('/api/documents/doc-1/ingestion', expect.any(Object))
+  })
+})
+
+describe('uploadFileToPresignedUrl', () => {
+  class FakeXhr {
+    constructor() {
+      this.upload = {}
+      this.requestHeaders = {}
+      FakeXhr.instances.push(this)
+    }
+    open(method, url) {
+      this.method = method
+      this.url = url
+    }
+    setRequestHeader(key, value) {
+      this.requestHeaders[key] = value
+    }
+    send(body) {
+      this.sentBody = body
+    }
+  }
+  FakeXhr.instances = []
+
+  beforeEach(() => {
+    FakeXhr.instances = []
+    vi.stubGlobal('XMLHttpRequest', FakeXhr)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('PUTs the file to the presigned URL and reports progress', async () => {
+    const file = { type: 'application/pdf', name: 'doc.pdf' }
+    const progressUpdates = []
+
+    const promise = uploadFileToPresignedUrl('http://minio.test/upload', file, {
+      onProgress: ratio => progressUpdates.push(ratio),
+    })
+
+    const xhr = FakeXhr.instances[0]
+    expect(xhr.method).toBe('PUT')
+    expect(xhr.url).toBe('http://minio.test/upload')
+    expect(xhr.sentBody).toBe(file)
+
+    xhr.upload.onprogress({ lengthComputable: true, loaded: 50, total: 100 })
+    xhr.status = 200
+    xhr.onload()
+
+    await expect(promise).resolves.toBeUndefined()
+    expect(progressUpdates).toEqual([0.5])
+  })
+
+  it('rejects when the upload responds with a non-2xx status', async () => {
+    const file = { type: 'application/pdf' }
+    const promise = uploadFileToPresignedUrl('http://minio.test/upload', file)
+
+    const xhr = FakeXhr.instances[0]
+    xhr.status = 500
+    xhr.onload()
+
+    await expect(promise).rejects.toThrow('HTTP 500')
+  })
+
+  it('rejects on a network error', async () => {
+    const file = { type: 'application/pdf' }
+    const promise = uploadFileToPresignedUrl('http://minio.test/upload', file)
+
+    FakeXhr.instances[0].onerror()
+
+    await expect(promise).rejects.toThrow('ağ hatası')
   })
 })
 

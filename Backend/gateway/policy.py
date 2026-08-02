@@ -18,6 +18,14 @@ VALID_EMBEDDING_MODELS = {
 }
 VALID_ONTOLOGY_LANGUAGES = {"en", "tr"}
 
+# Document ingestion (PDF upload / URL scraping) guardrails.
+MAX_PDF_UPLOAD_BYTES = int(os.getenv("MAX_PDF_UPLOAD_BYTES", str(20 * 1024 * 1024)))
+URL_FETCH_TIMEOUT_SECONDS = float(os.getenv("URL_FETCH_TIMEOUT_SECONDS", "15"))
+MAX_URL_CONTENT_BYTES = int(os.getenv("MAX_URL_CONTENT_BYTES", str(5 * 1024 * 1024)))
+MAX_URL_REDIRECTS = int(os.getenv("MAX_URL_REDIRECTS", "5"))
+ALLOWED_URL_SCHEMES = {"http", "https"}
+ALLOWED_PDF_CONTENT_TYPES = {"application/pdf"}
+
 
 class PolicyError(Exception):
     def __init__(self, message: str, *, status_code: int = 422):
@@ -33,6 +41,15 @@ class ActiveJobLimitExceeded(PolicyError):
             status_code=429,
         )
         self.limit = limit
+
+
+class DocumentNotReadyError(PolicyError):
+    def __init__(self, ingestion_status: str):
+        super().__init__(
+            f"Doküman henüz hazır değil (durum: {ingestion_status}); extraction job oluşturulamaz",
+            status_code=409,
+        )
+        self.ingestion_status = ingestion_status
 
 
 def validate_text_length(text: str) -> None:
