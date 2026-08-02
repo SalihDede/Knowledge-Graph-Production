@@ -67,6 +67,21 @@ def test_extract_routes_wikontic_and_preserves_evidence(monkeypatch) -> None:
     assert response.json()["highlight"] == ["Einstein"]
 
 
+def test_extract_rejects_blank_text() -> None:
+    response = client.post(
+        "/api/extract",
+        json={
+            "text": "   ",
+            "model": "google/gemini-2.5-flash-lite",
+            "kg_type": "wicontic",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert response.json()["error"]["request_id"].startswith("req_")
+
+
 @pytest.mark.asyncio
 async def test_wikontic_adapter_preserves_fields(monkeypatch) -> None:
     response = httpx.Response(

@@ -1,16 +1,23 @@
 import json
+import logging
 import os
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from accounts import install_accounts
 from accounts.setup import accounts_ready
+from gateway_middleware import (
+    MiddlewareSettings,
+    install_error_handlers,
+    install_platform_middleware,
+)
+from gateway_middleware.context import request_id_context
 from visualization import build_graph_html, build_source_graph_html
 from llm import extract_triplets
 from prompts import extract_with_ape, extract_with_dspy, extract_with_textgrad
@@ -21,17 +28,21 @@ from kggen_pipeline import (
     extract_with_kggen_textgrad,
 )
 
+logger = logging.getLogger(__name__)
+middleware_settings = MiddlewareSettings.from_env()
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_methods=["GET", "POST"],
+    allow_origins=list(middleware_settings.allowed_origins),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
 install_accounts(app)
+install_error_handlers(app)
+install_platform_middleware(app, middleware_settings)
 
 BASE_DIR       = os.path.dirname(__file__)
 MODELS_FILE    = os.path.join(BASE_DIR, "allowedOpenroutherLLMModels.json")
@@ -60,18 +71,20 @@ async def ready():
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(f"{WIKONTIC_URL}/health/ready")
         if not response.is_success:
-            raise HTTPException(status_code=503, detail=_response_detail(response))
+            raise HTTPException(status_code=503, detail="Wikontic is unavailable")
     except HTTPException:
         raise
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=503, detail=f"Wikontic is unavailable: {exc}")
+        logger.warning("Wikontic readiness check failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Wikontic is unavailable") from exc
     try:
         if not await accounts_ready(app):
             raise HTTPException(status_code=503, detail="Account services are unavailable")
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Account services are unavailable: {exc}")
+        logger.warning("Account readiness check failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Account services are unavailable") from exc
     return {"status": "ok", "service": "backend", "wikontic": "ready"}
 
 
@@ -93,6 +106,13 @@ class ExtractRequest(BaseModel):
     embedding_model: str = "contriever" # contriever | bge_m3 | turkish_e5_large | turkish_sbert_mean_nli_stsb | mft_random
     ontology_language: str = "en"       # en | tr
 
+    @field_validator("text")
+    @classmethod
+    def reject_empty_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Metin boş olamaz")
+        return value
+
 
 async def _extract_wikontic(
     text: str,
@@ -109,8 +129,17 @@ async def _extract_wikontic(
         "ontology_language": ontology_language,
         "prompt_type":       prompt_type,
     }
-    async with httpx.AsyncClient(timeout=WIKONTIC_TIMEOUT_SECONDS) as client:
-        resp = await client.post(f"{WIKONTIC_URL}/extract", json=payload)
+    try:
+        async with httpx.AsyncClient(timeout=WIKONTIC_TIMEOUT_SECONDS) as client:
+            resp = await client.post(
+                f"{WIKONTIC_URL}/extract",
+                json=payload,
+                headers={"X-Request-ID": request_id_context.get()},
+            )
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="Wikontic isteği zaman aşımına uğradı") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Wikontic servisine ulaşılamadı") from exc
 
     if not resp.is_success:
         upstream_status = resp.status_code
@@ -167,8 +196,9 @@ async def extract(body: ExtractRequest):
             raise HTTPException(status_code=400, detail=f"Bilinmeyen kg_type: {body.kg_type}")
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as exc:
+        logger.error("Extraction request failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Triple çıkarma işlemi tamamlanamadı") from exc
 
     # Baş varlıkları highlight olarak döndür
     highlight = list({t.get("baş", "") for t in triplets if t.get("baş")})

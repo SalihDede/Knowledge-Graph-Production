@@ -62,24 +62,24 @@ Platform anonymous-first çalışacaktır. Kullanıcı giriş yapmadan triple ç
 
 ### 2. Middleware
 
-- [ ] Her isteğe request ID verme
-- [ ] Request ID'yi downstream servislere aktarma
-- [ ] Güvenli JSON access ve hata logları
-- [ ] Merkezi ve standart hata cevapları
-- [ ] API anahtarı, cookie ve doküman içeriğini loglardan temizleme
-- [ ] Boş veya geçersiz içerikleri reddetme
-- [ ] Request boyutu sınırı
-- [ ] Environment tabanlı CORS ve Origin kontrolü
+- [x] Her isteğe request ID verme
+- [x] Request ID'yi downstream servislere aktarma
+- [x] Güvenli JSON access ve hata logları
+- [x] Merkezi ve standart hata cevapları
+- [x] API anahtarı, cookie ve doküman içeriğini loglardan temizleme
+- [x] Boş veya geçersiz içerikleri reddetme
+- [x] Request boyutu sınırı
+- [x] Environment tabanlı CORS ve Origin kontrolü
 - [x] İmzalı anonim ziyaretçi cookie'si
 - [x] Session doğrulama ve kullanıcı context'i
-- [ ] Güvenli upstream timeout yönetimi
-- [ ] Redis tabanlı rate limit
+- [x] Güvenli upstream timeout yönetimi
+- [x] Redis tabanlı rate limit
 - [ ] Extraction concurrency limiti
 - [ ] Hash tabanlı duplicate kontrolü
 - [ ] Devam eden aynı işlemin tekrar başlatılmasını engelleme
-- [ ] Unit ve integration testleri
+- [x] Unit ve integration testleri
 
-Temel middleware tamamlandıktan sonra Redis tabanlı rate limit ve duplicate önleme eklenecektir. Duplicate anahtarı yalnızca metinden değil; model, KG yöntemi, prompt, embedding modeli, ontology dili ve pipeline sürümünden üretilecektir.
+Temel middleware ve rate limit tamamlandı. Duplicate kontrolü job/doküman modeliyle birlikte eklenecektir. Duplicate anahtarı yalnızca metinden değil; model, KG yöntemi, prompt, embedding modeli, ontology dili ve pipeline sürümünden üretilecektir.
 
 ### 3. Frontend
 
@@ -230,6 +230,45 @@ AUTH_COOKIE_DOMAIN=example.com
 ```
 
 PostgreSQL şeması backend başlarken Alembic tarafından otomatik uygulanır. Redis yalnızca giriş oturumlarını tutar; anonim ziyaretçi kimliği PostgreSQL'de kalıcıdır.
+
+## Middleware davranışı
+
+Gateway bütün API isteklerine bir `X-Request-ID` verir ve bu kimliği Wikontic çağrılarına aktarır. Hata cevapları aynı sözleşmeyi kullanır:
+
+```json
+{
+  "detail": "İnsan tarafından okunabilir açıklama",
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "request_id": "req_..."
+  }
+}
+```
+
+Middleware şu kontrolleri gateway seviyesinde uygular:
+
+- JSON access/error logları; cookie, API anahtarı ve istek gövdesi loglanmaz.
+- İzin verilen origin, JSON content type ve maksimum istek boyutu kontrolü.
+- Redis üzerinde IP bazlı, sabit zaman pencereli genel API, auth ve extraction limitleri.
+- `RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset` ve gerektiğinde `Retry-After` başlıkları.
+- Redis rate limit servisi kullanılamıyorsa korunan endpoint için güvenli `503` cevabı.
+- Upstream bağlantı ve zaman aşımı hatalarında iç ayrıntıları gizleyen `502/504` cevapları.
+
+Yerel varsayılanlar `.env.example` içindedir. Üretimde en az aşağıdaki değerleri ortama göre değiştirin:
+
+```env
+ALLOWED_ORIGINS=https://uygulama.example.com
+MAX_REQUEST_BYTES=2097152
+TRUST_PROXY_HEADERS=true
+LOG_HASH_SALT=uzun-rastgele-bir-deger
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_WINDOW_SECONDS=60
+RATE_LIMIT_GENERAL_REQUESTS=120
+RATE_LIMIT_AUTH_REQUESTS=10
+RATE_LIMIT_EXTRACT_REQUESTS=10
+```
+
+`TRUST_PROXY_HEADERS=true` yalnızca backend doğrudan internete açılmadığında ve istekler güvenilen Caddy katmanından geçtiğinde kullanılmalıdır.
 
 ## Çalıştırma
 
