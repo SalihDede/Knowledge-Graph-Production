@@ -62,3 +62,22 @@ class ExtractionJobResponse(BaseModel):
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None
+
+
+class ExtractionJobSummary(BaseModel):
+    id: str
+    document_id: str
+    workspace_id: str
+    document_title: str | None
+    document_preview: str
+    triple_count: int
+    model: str
+    kg_type: str
+    prompt_type: str
+    embedding_model: str
+    ontology_language: str
+    status: JobStatus
+    error_message: str | None
+    created_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None

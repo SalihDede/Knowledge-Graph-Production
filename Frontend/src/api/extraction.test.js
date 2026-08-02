@@ -1,13 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  buildCardFromJob,
   computeDurationMs,
   createDocument,
   createExtractionJob,
   getDocument,
   getExtractionJob,
   getJobTriples,
+  listExtractionJobs,
   mapJobStatusToCardStatus,
   mapTriplesToLegacyFormat,
+  updateTripleStatus,
 } from './extraction'
 
 function jsonResponse(body, { ok = true, status = 200, requestId = 'req_test123' } = {}) {
@@ -182,5 +185,90 @@ describe('API client', () => {
       status: 404,
       requestId: 'req_abc',
     })
+  })
+
+  it('listExtractionJobs encodes pagination and filters as query params', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse([]))
+
+    await listExtractionJobs({ status: 'completed', documentId: 'doc-1', limit: 10, offset: 20 })
+
+    const [url] = fetch.mock.calls[0]
+    expect(url).toBe('/api/extraction-jobs?limit=10&offset=20&status=completed&document_id=doc-1')
+  })
+
+  it('listExtractionJobs defaults to limit 50 offset 0 with no filters', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse([]))
+
+    await listExtractionJobs()
+
+    const [url] = fetch.mock.calls[0]
+    expect(url).toBe('/api/extraction-jobs?limit=50&offset=0')
+  })
+
+  it('updateTripleStatus PATCHes the new status', async () => {
+    fetch.mockResolvedValueOnce(jsonResponse({ id: 'triple-1', status: 'verified' }))
+
+    await updateTripleStatus('triple-1', 'verified')
+
+    expect(fetch).toHaveBeenCalledWith('/api/triples/triple-1/status', expect.objectContaining({
+      method: 'PATCH',
+      body: JSON.stringify({ status: 'verified' }),
+    }))
+  })
+})
+
+describe('buildCardFromJob', () => {
+  const baseJob = {
+    id: 'job-1',
+    document_id: 'doc-1',
+    model: 'google/gemini-2.5-flash-lite',
+    kg_type: 'wikipedia',
+    prompt_type: 'temel',
+    embedding_model: 'contriever',
+    ontology_language: 'en',
+    status: 'completed',
+    error_message: null,
+    created_at: '2026-01-01T00:00:00.000Z',
+    completed_at: '2026-01-01T00:00:05.000Z',
+  }
+
+  it('builds a completed card with mapped triplets and raw triples preserved', () => {
+    const card = buildCardFromJob({
+      cardId: 'card-1',
+      job: baseJob,
+      documentText: 'Tam metin.',
+      rawTriples: [{ id: 't1', subject: 'A', predicate: 'rel', object: 'B', evidence: [] }],
+    })
+
+    expect(card.id).toBe('card-1')
+    expect(card.jobId).toBe('job-1')
+    expect(card.documentId).toBe('doc-1')
+    expect(card.status).toBe('done')
+    expect(card.text).toBe('Tam metin.')
+    expect(card.triplets).toEqual([
+      { baş: 'A', baş_tipi: '', ilişki: 'rel', uç: 'B', uç_tipi: '', qualifiers: [], kaynak_cumle: '' },
+    ])
+    expect(card.rawTriples).toHaveLength(1)
+    expect(card.durationMs).toBe(5000)
+    expect(card.errorMessage).toBe('')
+  })
+
+  it('surfaces the error message for a failed job', () => {
+    const card = buildCardFromJob({
+      cardId: 'card-2',
+      job: { ...baseJob, status: 'failed', error_message: 'Model reddedildi.' },
+      documentText: 'Tam metin.',
+    })
+
+    expect(card.status).toBe('error')
+    expect(card.errorMessage).toBe('Model reddedildi.')
+  })
+
+  it('maps queued/running jobs to the loading card status', () => {
+    const queuedCard = buildCardFromJob({ cardId: 'c', job: { ...baseJob, status: 'queued' }, documentText: '' })
+    const runningCard = buildCardFromJob({ cardId: 'c', job: { ...baseJob, status: 'running' }, documentText: '' })
+
+    expect(queuedCard.status).toBe('loading')
+    expect(runningCard.status).toBe('loading')
   })
 })

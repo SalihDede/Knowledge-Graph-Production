@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -237,3 +238,51 @@ async def get_accessible_job(
     ):
         return None
     return job
+
+
+DOCUMENT_PREVIEW_LENGTH = 200
+
+
+@dataclass
+class JobHistoryEntry:
+    job: ExtractionJob
+    document_title: str | None
+    document_preview: str
+
+
+def _build_preview(text: str, length: int = DOCUMENT_PREVIEW_LENGTH) -> str:
+    normalized = text.strip()
+    if len(normalized) <= length:
+        return normalized
+    return normalized[:length].rstrip() + "…"
+
+
+async def list_jobs_for_workspace(
+    db: AsyncSession,
+    *,
+    workspace_id: uuid.UUID,
+    limit: int,
+    offset: int,
+    status: JobStatus | None = None,
+    document_id: uuid.UUID | None = None,
+) -> list[JobHistoryEntry]:
+    """Job history for a workspace, newest first. Joins in just the document
+    title and a short preview -- never the full raw/normalized text -- so the
+    listing stays cheap regardless of document size."""
+    stmt = (
+        select(ExtractionJob, Document.title, Document.normalized_text)
+        .join(Document, Document.id == ExtractionJob.document_id)
+        .where(ExtractionJob.workspace_id == workspace_id)
+    )
+    if status is not None:
+        stmt = stmt.where(ExtractionJob.status == status)
+    if document_id is not None:
+        stmt = stmt.where(ExtractionJob.document_id == document_id)
+
+    stmt = stmt.order_by(ExtractionJob.created_at.desc()).limit(limit).offset(offset)
+
+    result = await db.execute(stmt)
+    return [
+        JobHistoryEntry(job=job, document_title=title, document_preview=_build_preview(text))
+        for job, title, text in result.all()
+    ]

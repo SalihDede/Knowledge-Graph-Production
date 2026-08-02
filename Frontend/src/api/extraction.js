@@ -63,6 +63,22 @@ export function getJobTriples(jobId) {
   return apiRequest(`/api/extraction-jobs/${jobId}/triples`)
 }
 
+export function listExtractionJobs({ status, documentId, limit = 50, offset = 0 } = {}) {
+  const params = new URLSearchParams()
+  params.set('limit', String(limit))
+  params.set('offset', String(offset))
+  if (status) params.set('status', status)
+  if (documentId) params.set('document_id', documentId)
+  return apiRequest(`/api/extraction-jobs?${params.toString()}`)
+}
+
+export function updateTripleStatus(tripleId, status) {
+  return apiRequest(`/api/triples/${tripleId}/status`, {
+    method: 'PATCH',
+    body: JSON.stringify({ status }),
+  })
+}
+
 // The backend stores triples with English field names (subject/predicate/object);
 // the studio UI (ResultCard, KGGraph, exports, ...) speaks the original Turkish
 // triple schema (baş/ilişki/uç). This is the single place that bridges the two.
@@ -94,4 +110,35 @@ export function computeDurationMs(startedAtIso, completedAtIso) {
   const end = completedAtIso ? new Date(completedAtIso).getTime() : Date.now()
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null
   return end - start
+}
+
+// Builds a full result-card object from a job (either the full
+// ExtractionJobResponse or the lighter ExtractionJobSummary from the history
+// list -- both carry the same pipeline/status fields) plus the document text
+// and, once available, the job's raw triples. Shared by the localStorage
+// restore-on-mount flow and the history panel's "load into a slot" action so
+// a reconstructed card looks identical regardless of where it came from.
+export function buildCardFromJob({ cardId, job, documentText, rawTriples = [], requestId = null }) {
+  const { triplets, highlight } = mapTriplesToLegacyFormat(rawTriples)
+  return {
+    id: cardId,
+    model: job.model,
+    text: documentText,
+    kgType: job.kg_type,
+    promptType: job.prompt_type,
+    embeddingModel: job.embedding_model,
+    ontologyLanguage: job.ontology_language,
+    status: mapJobStatusToCardStatus(job.status),
+    jobStatus: job.status,
+    jobId: job.id,
+    documentId: job.document_id,
+    requestId,
+    triplets,
+    highlight,
+    rawTriples,
+    errorMessage: job.status === 'failed' ? (job.error_message || '') : '',
+    startedAt: job.created_at,
+    completedAt: job.completed_at,
+    durationMs: computeDurationMs(job.created_at, job.completed_at),
+  }
 }

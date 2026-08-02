@@ -5,6 +5,8 @@ import ResultCard  from './ResultCard'
 import TripleComparisonTable from './TripleComparisonTable'
 import SourceProvenanceGraph from './SourceProvenanceGraph'
 import AuthPanel from './AuthPanel'
+import HistoryPanel from './HistoryPanel'
+import TripleReviewModal from './TripleReviewModal'
 import { downloadJson, downloadText, parseImportedTriples } from './utils/triplesIO'
 import {
   LANGUAGE_OPTIONS,
@@ -15,13 +17,16 @@ import {
   saveLanguage,
 } from './i18n'
 import {
+  buildCardFromJob,
   computeDurationMs,
   createDocument,
   createExtractionJob,
   getDocument,
   getExtractionJob,
   getJobTriples,
+  listExtractionJobs,
   mapTriplesToLegacyFormat,
+  updateTripleStatus,
 } from './api/extraction'
 import { addActiveJob, loadActiveJobs, removeActiveJob } from './api/activeJobsStorage'
 
@@ -380,6 +385,10 @@ function App() {
   const [selectedOntologyLanguage, setSelectedOntologyLanguage] = useState('en')
   const [identity, setIdentity] = useState(null)
   const [authOpen, setAuthOpen] = useState(false)
+  const [historyJobs, setHistoryJobs] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(true)
+  const [historyError, setHistoryError] = useState(null)
+  const [reviewCardId, setReviewCardId] = useState(null)
   const referenceInputRef = useRef(null)
   const wiconticSettingsRef = useRef(null)
   const previousKgRef = useRef(selectedKg)
@@ -452,6 +461,7 @@ function App() {
               jobStatus: 'completed',
               triplets,
               highlight,
+              rawTriples: triples,
               errorMessage: '',
               completedAt: job.completed_at || new Date().toISOString(),
               durationMs: computeDurationMs(c.startedAt, job.completed_at),
@@ -508,36 +518,21 @@ function App() {
             getDocument(entry.documentId),
           ])
 
-          let triplets = []
-          let highlight = []
+          let rawTriples = []
           if (job.status === 'completed') {
             const { data: triples } = await getJobTriples(entry.jobId)
-            ;({ triplets, highlight } = mapTriplesToLegacyFormat(triples))
+            rawTriples = triples
           }
           if (job.status === 'completed' || job.status === 'failed') {
             removeActiveJob(entry.jobId)
           }
 
-          restored.push({
-            id: `restored-${entry.jobId}`,
-            model: job.model,
-            text: documentRecord.normalized_text,
-            kgType: job.kg_type,
-            promptType: job.prompt_type,
-            embeddingModel: job.embedding_model,
-            ontologyLanguage: job.ontology_language,
-            status: job.status === 'completed' ? 'done' : job.status === 'failed' ? 'error' : 'loading',
-            jobStatus: job.status,
-            jobId: entry.jobId,
-            documentId: entry.documentId,
-            triplets,
-            highlight,
-            errorMessage: job.status === 'failed' ? (job.error_message || '') : '',
-            requestId: null,
-            startedAt: job.created_at,
-            completedAt: job.completed_at,
-            durationMs: computeDurationMs(job.created_at, job.completed_at),
-          })
+          restored.push(buildCardFromJob({
+            cardId: `restored-${entry.jobId}`,
+            job,
+            documentText: documentRecord.normalized_text,
+            rawTriples,
+          }))
         } catch {
           removeActiveJob(entry.jobId)
         }
@@ -568,6 +563,64 @@ function App() {
 
     return () => clearInterval(interval)
   }, [])
+
+  // Loads the workspace's job history. Called on mount and whenever identity
+  // changes (login/logout): the backend resolves "the workspace" from the
+  // session/visitor cookie, so logging in transparently reveals the same
+  // anonymous history once the visitor's workspace is claimed by the account.
+  async function loadHistory() {
+    setHistoryLoading(true)
+    setHistoryError(null)
+    try {
+      const { data } = await listExtractionJobs({ limit: 50 })
+      setHistoryJobs(data)
+    } catch (error) {
+      setHistoryError({ message: error.message || t.app.llmRequestFailed, requestId: error.requestId || null })
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    loadHistory()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identity])
+
+  async function handleSelectHistoryJob(job) {
+    if (cards.some(card => card.jobId === job.id)) return
+    if (cards.length >= 3) return
+
+    try {
+      const [{ data: documentRecord }, tripleResult] = await Promise.all([
+        getDocument(job.document_id),
+        job.status === 'completed' ? getJobTriples(job.id) : Promise.resolve({ data: [] }),
+      ])
+
+      const card = buildCardFromJob({
+        cardId: `history-${job.id}`,
+        job,
+        documentText: documentRecord.normalized_text,
+        rawTriples: tripleResult.data,
+      })
+
+      setCards(prev => [...prev, card])
+      setSubmitted(true)
+    } catch (error) {
+      setHistoryError({ message: error.message || t.app.llmRequestFailed, requestId: error.requestId || null })
+    }
+  }
+
+  async function handleUpdateTripleStatus(tripleId, nextStatus) {
+    const { data: updatedTriple } = await updateTripleStatus(tripleId, nextStatus)
+    setCards(prev => prev.map(card => {
+      if (!card.rawTriples?.some(triple => triple.id === tripleId)) return card
+      const rawTriples = card.rawTriples.map(triple => (triple.id === tripleId ? updatedTriple : triple))
+      const { triplets, highlight } = mapTriplesToLegacyFormat(rawTriples)
+      return { ...card, rawTriples, triplets, highlight }
+    }))
+  }
+
+  const reviewCard = cards.find(card => card.id === reviewCardId) ?? null
 
   const isActive = text.length > 0
   const summaryStats = getCardStats(cards)
@@ -792,6 +845,7 @@ function App() {
       requestId:      null,
       triplets:       [],
       highlight:      [],
+      rawTriples:     [],
       errorMessage:   '',
       startedAt,
       completedAt:    null,
@@ -845,6 +899,14 @@ function App() {
         onIdentityChange={setIdentity}
         t={t}
       />
+      {reviewCard && (
+        <TripleReviewModal
+          card={reviewCard}
+          onClose={() => setReviewCardId(null)}
+          onUpdateTripleStatus={handleUpdateTripleStatus}
+          t={t}
+        />
+      )}
 
       <aside className="studio-sidebar" aria-label={t.app.sidebarAria}>
         <div className="brand-lockup">
@@ -1048,6 +1110,15 @@ function App() {
             ))}
           </select>
         </div>
+
+        <HistoryPanel
+          jobs={historyJobs}
+          loading={historyLoading}
+          error={historyError}
+          onSelectJob={handleSelectHistoryJob}
+          onRefresh={loadHistory}
+          t={t}
+        />
 
       </aside>
 
@@ -1257,6 +1328,7 @@ function App() {
                     getSlotLabel(cards.findIndex(item => item.id === card.id), t),
                     'generated'
                   )}
+                  onReview={() => setReviewCardId(card.id)}
                   t={t}
                 />
               ))}

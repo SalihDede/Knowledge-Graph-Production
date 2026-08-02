@@ -89,14 +89,14 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 
 - [x] Anonim oturum göstergesi
 - [x] Giriş ve hesap oluşturma ekranları
-- [ ] Anonim geçmişi hesaba aktarma akışı
+- [x] Anonim geçmişi hesaba aktarma akışı (giriş yapınca aynı workspace geçmişi otomatik görünür, bkz. "Workspace geçmişi ve triple review")
 - [ ] Text, PDF ve URL girişi
 - [x] Extraction job durumunu gösterme (doküman → job → polling → triple akışı, bkz. "Frontend async extraction akışı")
 - [x] Bekliyor, çalışıyor, tamamlandı ve hata durumları (`queued`/`running` → "Çalışıyor", `completed` → "Hazır", `failed` → "Hata")
-- [ ] Geçmiş doküman ve extraction listesi
-- [ ] Triple detay ve kaynak kanıt görünümü (yalnızca `kaynak_cumle` metni taşınıyor; ayrı bir provenance/evidence görünümü yok)
+- [x] Geçmiş doküman ve extraction listesi (sidebar'daki Geçmiş paneli)
+- [x] Triple detay ve kaynak kanıt görünümü (Triple İnceleme penceresi, `char_start`/`char_end` vurgulamalı)
 - [ ] RAG doğrulama ve consensus sonuçları
-- [ ] Triple düzenleme, reddetme ve onaylama
+- [x] Triple düzenleme, reddetme ve onaylama
 - [ ] Sonuç indirme ve dışa aktarma
 - [ ] Kullanım kotası ve model maliyet göstergesi
 - [x] Hatalarda request ID gösterme
@@ -244,6 +244,7 @@ GET  /api/documents
 GET  /api/documents/{id}
 
 POST /api/extraction-jobs
+GET  /api/extraction-jobs
 GET  /api/extraction-jobs/{id}
 ```
 
@@ -278,6 +279,17 @@ Bu parametrelerden (`kg_type`, `prompt_type`, `embedding_model`, `ontology_langu
 Job oluşturulduğunda (yeni bir kayıt açıldıysa) job kimliği Celery üzerinden `extraction-worker` container'ına gönderilir; işleme aşağıdaki "Extraction worker" bölümünde anlatılmaktadır.
 
 Job oluşturmadan önce istek "Extraction policy" bölümünde açıklanan kontrollerden geçer: geçersiz `kg_type`/`prompt_type`/`embedding_model`/`ontology_language` veya izin verilmeyen `model` `422` ile, çalışma alanı başına aktif iş limiti aşımı `429` ile reddedilir — bu durumlarda job hiç oluşturulmaz.
+
+`GET /api/extraction-jobs`, çağıran kimliğin (ziyaretçi ya da kullanıcı) çalışma alanına ait job geçmişini döndürür — en yeni önce. Sorgu parametreleri:
+
+```text
+?limit=50          # 1-200 arası, varsayılan 50
+&offset=0
+&status=completed  # queued | running | completed | failed
+&document_id=...
+```
+
+Cevaptaki her satır (`ExtractionJobSummary`) doküman başlığını, ilk ~200 karakterlik bir önizlemeyi ve o job'a ait triple sayısını içerir; dokümanın tam `raw_text`/`normalized_text` içeriğini **hiçbir zaman** döndürmez — bunun için ayrıca `GET /api/documents/{id}` çağrılmalıdır. Liste her zaman çağıranın kendi çalışma alanına göre filtrelenir; başka bir workspace'in job'ları hiçbir koşulda görünmez.
 
 ## Extraction policy
 
@@ -457,13 +469,32 @@ failed            → hata mesajı + istek kimliği (X-Request-ID) gösterilir
 - Job oluşturma anında zaten `completed`/`failed` dönerse (aynı pipeline için mevcut bir job'un yeniden kullanılması durumunda) sonuç ilk poll turunu beklemeden hemen işlenir.
 - Başarısız (`failed`) durumda kart hem `error_message`'ı hem de o anki HTTP cevabının `X-Request-ID` başlığını gösterir.
 
-Testler: `Frontend/src/api/extraction.test.js` (triple eşleme, durum eşleme, süre hesaplama, API istemcisi — `fetch` mock'lanarak) ve `Frontend/src/api/activeJobsStorage.test.js` (localStorage kalıcılığı, bozuk veri/geçersiz kayıtlara dayanıklılık). Çalıştırmak için:
+Testler: `Frontend/src/api/extraction.test.js` (triple eşleme, durum eşleme, süre hesaplama, `buildCardFromJob`, API istemcisi — `fetch` mock'lanarak) ve `Frontend/src/api/activeJobsStorage.test.js` (localStorage kalıcılığı, bozuk veri/geçersiz kayıtlara dayanıklılık). Çalıştırmak için:
 
 ```bash
 cd Frontend
 npm install
 npm test
 ```
+
+## Workspace geçmişi ve triple review
+
+Tamamlanmış job'lar PostgreSQL'de kalıcı olarak durur; sayfa yenilendiğinde (ve daha önce `localStorage`'da hiç iz bırakmamış eski job'lar için de) kullanıcı bunlara sidebar'daki **Geçmiş** panelinden ulaşabilir. Bu panel `GET /api/extraction-jobs` listesini gösterir ve şu durumları ayrı ayrı ele alır:
+
+- **Loading**: `t.historyPanel.loading` metni.
+- **Empty**: hiç job yoksa `t.historyPanel.empty`.
+- **Error**: istek başarısız olursa hata mesajı + varsa `X-Request-ID` gösterilir; "Yenile" butonu tekrar dener.
+- Her satır doküman başlığını/önizlemesini, durumunu (Sırada/Çalışıyor/Tamamlandı/Hata) ve triple sayısını gösterir.
+
+Bir geçmiş satırına tıklamak (`handleSelectHistoryJob` — `App.jsx`), o job'un dokümanını (`GET /api/documents/{id}`) ve — tamamlanmışsa — triple'larını (`GET /api/extraction-jobs/{id}/triples`) çekip mevcut sonuç kartı bileşenini (`ResultCard`) aynı şekilde yeniden oluşturur; en fazla 3 aktif kart sınırı burada da geçerlidir.
+
+Geçmiş, `identity` her değiştiğinde (giriş/çıkış) otomatik olarak yeniden yüklenir. Bunun için herhangi bir özel senkronizasyon gerekmez: backend zaten workspace'i oturum/ziyaretçi çerezinden çözer ve kullanıcı giriş yaptığında ziyaretçinin çalışma alanını hesaba taşır (bkz. "Doküman ve extraction job API'si"), dolayısıyla aynı `GET /api/extraction-jobs` isteği artık aynı geçmişi yeni kimlik altında döndürür — anonim geçmiş kaybolmaz.
+
+Tamamlanmış bir kartın başlığındaki onay ikonu **Triple İnceleme** penceresini açar (`TripleReviewModal.jsx`):
+
+- Sol sütun: job'un tüm triple'ları, durum rozetleriyle (Aday/Onaylandı/Reddedildi) birlikte.
+- Sağ sütun: seçili triple'ın kaynak kanıtları — dokümanın tam metni içinde, triple'ın `char_start`/`char_end` aralığı `<mark>` ile vurgulanarak gösterilir.
+- Her triple için üç aksiyon: **Onayla** (`PATCH .../status` → `verified`), **Reddet** (→ `rejected`), **Geri al** (→ `candidate`). Güncelleme başarılı olduğunda kartın hem `rawTriples`'ı hem de KG grafiğinde kullanılan eşlenmiş `triplets`'ı yerinde güncellenir; başarısız olursa modalde bir hata mesajı gösterilir.
 
 ## Middleware davranışı
 

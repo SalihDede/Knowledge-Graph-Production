@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from accounts.models import User
@@ -137,6 +137,21 @@ async def list_triples_for_job(db: AsyncSession, *, job: ExtractionJob) -> list[
         .order_by(Triple.created_at.asc())
     )
     return list(result)
+
+
+async def count_triples_by_job(
+    db: AsyncSession, *, job_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, int]:
+    """Bulk triple counts for a set of jobs, used by the job history listing
+    so it doesn't run one count query per row."""
+    if not job_ids:
+        return {}
+    result = await db.execute(
+        select(Triple.extraction_job_id, func.count(Triple.id))
+        .where(Triple.extraction_job_id.in_(job_ids))
+        .group_by(Triple.extraction_job_id)
+    )
+    return dict(result.all())
 
 
 async def get_accessible_triple(
