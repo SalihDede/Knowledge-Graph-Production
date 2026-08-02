@@ -21,14 +21,7 @@ from gateway_middleware import (
 )
 from gateway_middleware.context import request_id_context
 from visualization import build_graph_html, build_source_graph_html
-from llm import extract_triplets
-from prompts import extract_with_ape, extract_with_dspy, extract_with_textgrad
-from kggen_pipeline import (
-    extract_with_kggen_ape,
-    extract_with_kggen_dspy,
-    extract_with_kggen_temel,
-    extract_with_kggen_textgrad,
-)
+from extraction import ExtractionError, run_extraction
 
 logger = logging.getLogger(__name__)
 middleware_settings = MiddlewareSettings.from_env()
@@ -51,17 +44,6 @@ install_platform_middleware(app, middleware_settings)
 BASE_DIR       = os.path.dirname(__file__)
 MODELS_FILE    = os.path.join(BASE_DIR, "allowedOpenroutherLLMModels.json")
 WIKONTIC_URL   = os.getenv("WIKONTIC_URL", "http://localhost:8001")
-WIKONTIC_TIMEOUT_SECONDS = float(os.getenv("WIKONTIC_TIMEOUT_SECONDS", "170"))
-
-
-def _response_detail(response: httpx.Response) -> str:
-    try:
-        payload = response.json()
-    except ValueError:
-        return response.text or response.reason_phrase
-    if isinstance(payload, dict):
-        return str(payload.get("detail") or payload)
-    return str(payload)
 
 
 @app.get("/api/health/live")
@@ -118,91 +100,20 @@ class ExtractRequest(BaseModel):
         return value
 
 
-async def _extract_wikontic(
-    text: str,
-    llm_model: str,
-    embedding_model: str,
-    ontology_language: str,
-    prompt_type: str = "temel",
-) -> list[dict]:
-    """Calls the Wikontic service and normalises response to the app's Turkish field names."""
-    payload = {
-        "text":              text,
-        "embedding_model":   embedding_model,
-        "llm_model":         llm_model,
-        "ontology_language": ontology_language,
-        "prompt_type":       prompt_type,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=WIKONTIC_TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                f"{WIKONTIC_URL}/extract",
-                json=payload,
-                headers={"X-Request-ID": request_id_context.get()},
-            )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Wikontic isteği zaman aşımına uğradı") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="Wikontic servisine ulaşılamadı") from exc
-
-    if not resp.is_success:
-        upstream_status = resp.status_code
-        public_status = upstream_status if upstream_status in {400, 401, 403, 404, 409, 422, 503} else 502
-        raise HTTPException(status_code=public_status, detail=_response_detail(resp))
-
-    raw_triplets = resp.json().get("triplets", [])
-
-    # Map Wikontic field names → app field names
-    normalised = []
-    for t in raw_triplets:
-        normalised.append({
-            "baş":      t.get("subject", ""),
-            "baş_tipi": t.get("subject_type", ""),
-            "ilişki":   t.get("relation", ""),
-            "uç":       t.get("object", ""),
-            "uç_tipi":  t.get("object_type", ""),
-            "qualifiers": t.get("qualifiers", []),
-            "kaynak_cumle": t.get("kaynak_cumle", ""),
-        })
-    return normalised
-
-
 @app.post("/api/extract")
 async def extract(body: ExtractRequest):
     try:
-        if body.kg_type == "wicontic":
-            triplets = await _extract_wikontic(
-                body.text,
-                body.model,
-                body.embedding_model,
-                body.ontology_language,
-                body.prompt_type,
-            )
-        elif body.kg_type == "wikipedia":
-            if body.prompt_type == "ape":
-                triplets = await extract_with_ape(body.text, body.model)
-            elif body.prompt_type == "dspy":
-                triplets = await extract_with_dspy(body.text, body.model)
-            elif body.prompt_type == "textgrad":
-                triplets = await extract_with_textgrad(body.text, body.model)
-            else:
-                triplets = await extract_triplets(body.text, body.model)
-        elif body.kg_type == "kggen":
-            if body.prompt_type == "ape":
-                triplets = await extract_with_kggen_ape(body.text, body.model)
-            elif body.prompt_type == "dspy":
-                triplets = await extract_with_kggen_dspy(body.text, body.model)
-            elif body.prompt_type == "textgrad":
-                triplets = await extract_with_kggen_textgrad(body.text, body.model)
-            else:
-                triplets = await extract_with_kggen_temel(body.text, body.model)
-        else:
-            raise HTTPException(status_code=400, detail=f"Bilinmeyen kg_type: {body.kg_type}")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.error("Extraction request failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Triple çıkarma işlemi tamamlanamadı") from exc
+        triplets = await run_extraction(
+            text=body.text,
+            model=body.model,
+            kg_type=body.kg_type,
+            prompt_type=body.prompt_type,
+            embedding_model=body.embedding_model,
+            ontology_language=body.ontology_language,
+            request_id=request_id_context.get(),
+        )
+    except ExtractionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     # Baş varlıkları highlight olarak döndür
     highlight = list({t.get("baş", "") for t in triplets if t.get("baş")})

@@ -19,6 +19,7 @@ from accounts.security import create_session_token
 from accounts.store import SessionData
 from documents.models import Document, ExtractionJob
 from documents.routes import router as documents_router
+import documents.routes as documents_routes
 import triples.models  # noqa: F401  (register tables on Base.metadata)
 from triples.routes import router as triples_router
 from triples.service import TripleEvidenceInput, TripleInput, record_triples_for_job
@@ -44,7 +45,11 @@ class MemorySessionStore:
 
 
 @pytest.fixture()
-def triples_app(tmp_path: Path):
+def triples_app(tmp_path: Path, monkeypatch):
+    # These tests exercise the HTTP layer, not the Celery dispatch; avoid a real
+    # (and here, unreachable) broker call on every job-creation test.
+    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+
     database_path = tmp_path / "triples.sqlite3"
     engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
     sessions = async_sessionmaker(engine, expire_on_commit=False)

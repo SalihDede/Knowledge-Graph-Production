@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from accounts.models import User
@@ -67,6 +67,67 @@ async def record_triples_for_job(
     for triple in created:
         await db.refresh(triple)
     return created
+
+
+async def replace_triples_for_job(
+    db: AsyncSession,
+    *,
+    job: ExtractionJob,
+    document: Document,
+    triples: list[TripleInput],
+) -> list[Triple]:
+    """Atomically replaces every triple recorded for a job.
+
+    Extraction jobs can retry after a partial/failed write (broker redelivery,
+    worker crash mid-task). Wiping the job's previous triples before
+    re-inserting keeps re-runs idempotent instead of accumulating duplicates.
+    """
+    await db.execute(
+        delete(TripleEvidence).where(
+            TripleEvidence.triple_id.in_(
+                select(Triple.id).where(Triple.extraction_job_id == job.id)
+            )
+        )
+    )
+    await db.execute(delete(Triple).where(Triple.extraction_job_id == job.id))
+    return await record_triples_for_job(db, job=job, document=document, triples=triples)
+
+
+def build_triple_inputs_from_raw(raw_triplets: list[dict], normalized_text: str) -> list[TripleInput]:
+    """Maps the Turkish-keyed extraction output (baş/ilişki/uç/...) to TripleInput
+    rows, locating each triple's source sentence inside the document text."""
+    inputs: list[TripleInput] = []
+    for raw in raw_triplets:
+        subject = (raw.get("baş") or "").strip()
+        predicate = (raw.get("ilişki") or "").strip()
+        obj = (raw.get("uç") or "").strip()
+        if not subject or not predicate or not obj:
+            continue
+
+        evidence: list[TripleEvidenceInput] = []
+        source_text = (raw.get("kaynak_cumle") or "").strip()
+        if source_text:
+            char_start = normalized_text.find(source_text)
+            evidence.append(
+                TripleEvidenceInput(
+                    source_text=source_text,
+                    char_start=char_start if char_start != -1 else None,
+                    char_end=char_start + len(source_text) if char_start != -1 else None,
+                )
+            )
+
+        inputs.append(
+            TripleInput(
+                subject=subject,
+                subject_type=raw.get("baş_tipi") or None,
+                predicate=predicate,
+                object=obj,
+                object_type=raw.get("uç_tipi") or None,
+                qualifiers=raw.get("qualifiers") or None,
+                evidence=evidence,
+            )
+        )
+    return inputs
 
 
 async def list_triples_for_job(db: AsyncSession, *, job: ExtractionJob) -> list[Triple]:

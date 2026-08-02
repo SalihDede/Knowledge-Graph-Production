@@ -19,6 +19,7 @@ from accounts.security import create_session_token
 from accounts.store import SessionData
 import documents.models  # noqa: F401  (register tables on Base.metadata)
 from documents.routes import router as documents_router
+import documents.routes as documents_routes
 
 
 class MemorySessionStore:
@@ -41,7 +42,11 @@ class MemorySessionStore:
 
 
 @pytest.fixture()
-def documents_app(tmp_path: Path):
+def documents_app(tmp_path: Path, monkeypatch):
+    # These tests exercise the HTTP layer, not the Celery dispatch; avoid a real
+    # (and here, unreachable) broker call on every job-creation test.
+    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+
     database_path = tmp_path / "documents.sqlite3"
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{database_path}", connect_args={"timeout": 30}
