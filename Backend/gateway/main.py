@@ -12,6 +12,7 @@ load_dotenv()
 
 from accounts import install_accounts
 from accounts.setup import accounts_ready
+from documents import install_documents
 from gateway_middleware import (
     MiddlewareSettings,
     install_error_handlers,
@@ -40,7 +41,8 @@ app.add_middleware(
     allow_credentials=True,
 )
 
-install_accounts(app)
+accounts_runtime = install_accounts(app)
+install_documents(app, accounts_runtime)
 install_error_handlers(app)
 install_platform_middleware(app, middleware_settings)
 

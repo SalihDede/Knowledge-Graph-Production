@@ -49,13 +49,13 @@ Teknoloji kararları:
 Platform anonymous-first çalışacaktır. Kullanıcı giriş yapmadan triple çıkarabilecek ve aynı tarayıcıdan döndüğünde çalışma alanını görebilecektir.
 
 - [x] Anonim ziyaretçi cookie'si oluşturma
-- [ ] Anonim çalışma alanı oluşturma
+- [x] Anonim çalışma alanı oluşturma
 - [x] Kayıt, giriş, çıkış ve mevcut kullanıcı endpointleri
 - [ ] E-posta doğrulama
 - [ ] Şifre sıfırlama
 - [x] Şifreleri Argon2id ile hashleme
 - [x] HttpOnly server-side session kullanma
-- [ ] Anonim geçmişi kayıtlı hesaba aktarma
+- [x] Anonim geçmişi kayıtlı hesaba aktarma
 - [ ] Aktif oturumları görüntüleme ve kapatma
 - [ ] Hesap ve kullanıcı verilerini silme
 - [ ] Google/GitHub OAuth desteğini sonraki sürümde değerlendirme
@@ -75,11 +75,11 @@ Platform anonymous-first çalışacaktır. Kullanıcı giriş yapmadan triple ç
 - [x] Güvenli upstream timeout yönetimi
 - [x] Redis tabanlı rate limit
 - [ ] Extraction concurrency limiti
-- [ ] Hash tabanlı duplicate kontrolü
-- [ ] Devam eden aynı işlemin tekrar başlatılmasını engelleme
+- [x] Hash tabanlı duplicate kontrolü
+- [x] Devam eden aynı işlemin tekrar başlatılmasını engelleme
 - [x] Unit ve integration testleri
 
-Temel middleware ve rate limit tamamlandı. Duplicate kontrolü job/doküman modeliyle birlikte eklenecektir. Duplicate anahtarı yalnızca metinden değil; model, KG yöntemi, prompt, embedding modeli, ontology dili ve pipeline sürümünden üretilecektir.
+Temel middleware ve rate limit tamamlandı. Duplicate kontrolü doküman ve job modeliyle birlikte eklendi: doküman içeriği SHA-256 ile hashlenip aynı çalışma alanında tekrar kaydedilmiyor, extraction job'ları ise model, KG yöntemi, prompt, embedding modeli, ontology dili ve pipeline sürümünden üretilen bir fingerprint ile eşleşiyor; devam eden veya tamamlanmış aynı iş varsa yeniden kullanılıyor.
 
 ### 3. Frontend
 
@@ -104,10 +104,10 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 
 Mevcut gateway korunacak ve modüler bir yapıya ayrılacaktır.
 
-- [ ] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları
-- [ ] Text, PDF ve URL girişlerini ortak doküman modeline dönüştürme
-- [ ] Doküman hash'i ve pipeline fingerprint üretme
-- [ ] Extraction job oluşturma
+- [ ] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları (auth, documents ve extraction-jobs tamamlandı; triples ve models bekliyor)
+- [ ] Text, PDF ve URL girişlerini ortak doküman modeline dönüştürme (ilk aşamada yalnızca düz metin destekleniyor)
+- [x] Doküman hash'i ve pipeline fingerprint üretme
+- [x] Extraction job oluşturma
 - [ ] Wikontic adapter katmanı
 - [ ] OpenRouter provider katmanı
 - [ ] Model ve prompt ayarlarını doğrulama
@@ -125,12 +125,12 @@ PostgreSQL uygulamanın ana kayıt kaynağı olacaktır. Redis geçici veri ve k
 
 PostgreSQL tabloları:
 
-- [ ] `users`
-- [ ] `anonymous_visitors`
+- [x] `users`
+- [x] `anonymous_visitors`
 - [ ] `sessions`
-- [ ] `workspaces`
-- [ ] `documents`
-- [ ] `extraction_jobs`
+- [x] `workspaces`
+- [x] `documents`
+- [x] `extraction_jobs`
 - [ ] `triples`
 - [ ] `triple_evidence`
 - [ ] `verification_results`
@@ -230,6 +230,47 @@ AUTH_COOKIE_DOMAIN=example.com
 ```
 
 PostgreSQL şeması backend başlarken Alembic tarafından otomatik uygulanır. Redis yalnızca giriş oturumlarını tutar; anonim ziyaretçi kimliği PostgreSQL'de kalıcıdır.
+
+## Doküman ve extraction job API'si
+
+Her anonim ziyaretçi veya kullanıcı için otomatik olarak bir çalışma alanı (`workspace`) oluşturulur. Kullanıcı giriş yaptığında, anonim oturumdaki çalışma alanı otomatik olarak hesaba taşınır.
+
+```text
+POST /api/documents
+GET  /api/documents
+GET  /api/documents/{id}
+
+POST /api/extraction-jobs
+GET  /api/extraction-jobs/{id}
+```
+
+Doküman oluşturma isteği:
+
+```json
+{
+  "text": "İşlenecek düz metin",
+  "title": "Opsiyonel başlık"
+}
+```
+
+Gönderilen metin normalize edilir (Unicode NFC, satır sonu ve boşluk temizliği) ve SHA-256 ile hashlenir. Aynı çalışma alanında aynı içerik hash'ine sahip bir doküman zaten varsa yeni kayıt açılmaz, mevcut doküman `200` ile döndürülür; yeni bir doküman oluşturulduğunda cevap `201` olur.
+
+Extraction job oluşturma isteği:
+
+```json
+{
+  "document_id": "...",
+  "model": "openrouter/model-id",
+  "prompt_type": "temel",
+  "kg_type": "wikipedia",
+  "embedding_model": "contriever",
+  "ontology_language": "en"
+}
+```
+
+Bu parametrelerden (`kg_type`, `prompt_type`, `embedding_model`, `ontology_language`, `model`) bir pipeline fingerprint üretilir. Aynı doküman için aynı fingerprint'e sahip `queued`, `running` veya `completed` durumunda bir job zaten varsa yeni job açılmaz, mevcut job `200` ile döndürülür; yeni job oluşturulduğunda cevap `201` ve durum `queued` olur. Başarısız (`failed`) job'lar için yeniden deneme yeni bir job kaydı açar.
+
+Bu aşamada job'lar sadece kayda alınır; kuyruktan tüketilip işlenmesi (Celery worker) sonraki adımda eklenecektir.
 
 ## Middleware davranışı
 
