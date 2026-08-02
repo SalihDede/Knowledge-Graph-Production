@@ -10,6 +10,7 @@ pwdlib[argon2]>=0.2,<1
 email-validator>=2,<3
 itsdangerous>=2.2,<3
 alembic>=1.13,<2
+celery[redis]>=5.4,<6
 pyvis>=0.3.2,<1
 openai>=1.50,<3
 dspy-ai>=2.5,<4

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
 from accounts.runtime import AuthRuntime
+from worker.tasks import run_extraction_job
 from . import service
 from .models import Document, ExtractionJob
 from .schemas import (
@@ -15,6 +17,7 @@ from .schemas import (
     ExtractionJobResponse,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["documents"])
 
 
@@ -154,6 +157,16 @@ async def create_extraction_job(
             ontology_language=body.ontology_language,
             model=body.model,
         )
+
+    if created:
+        job_id = str(job.id)
+        try:
+            run_extraction_job.delay(job_id)
+        except Exception:
+            # Broker unreachable at publish time: the job row stays "queued" in
+            # Postgres rather than being lost, ready to be picked up by a
+            # future retry sweep or a manual re-trigger.
+            logger.warning("Extraction job %s could not be enqueued", job_id, exc_info=True)
 
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return _job_response(job)

@@ -9,6 +9,7 @@ Metin, PDF ve web kaynaklarından bilgi grafiği çıkarmak; üretilen triple'la
 - Wikontic ayrı bir servis olarak çalışıyor.
 - OpenRouter üzerinden model çağrısı yapılabiliyor.
 - MongoDB Atlas Local üzerinde Wikontic ontology ve embedding indeksleri bulunuyor.
+- Extraction job'ları artık ayrı bir Celery worker container'ında, Redis kuyruğu üzerinden asenkron işleniyor.
 - Docker Compose ile mevcut sistem ayağa kaldırılabiliyor.
 
 ## Hedef mimari
@@ -109,8 +110,8 @@ Mevcut gateway korunacak ve modüler bir yapıya ayrılacaktır.
 - [x] Doküman hash'i ve pipeline fingerprint üretme
 - [x] Extraction job oluşturma
 - [x] Job'a tüm pipeline parametrelerini (model, kg_type, prompt_type, embedding_model, ontology_language) ve pipeline_version'ı kaydetme
-- [ ] Wikontic adapter katmanı
-- [ ] OpenRouter provider katmanı
+- [x] Wikontic adapter katmanı
+- [x] OpenRouter provider katmanı
 - [ ] Model ve prompt ayarlarını doğrulama
 - [x] Triple ve provenance kaydı
 - [x] Candidate, verified ve rejected durumları
@@ -118,7 +119,7 @@ Mevcut gateway korunacak ve modüler bir yapıya ayrılacaktır.
 - [ ] Çoklu model consensus ve final judge
 - [ ] Global KG'ye yayınlama kontrolü
 - [ ] API sürümleme
-- [ ] Mevcut senkron `/api/extract` endpoint'i için geçiş dönemi
+- [x] Mevcut senkron `/api/extract` endpoint'i için geçiş dönemi (aynı `extraction` servisini paylaşıyor, frontend job sistemine tam geçene kadar korunuyor)
 
 ### 5. Veritabanları
 
@@ -156,17 +157,17 @@ Uzun süren işlemler API container'ında çalıştırılmayacaktır.
 
 Worker kuyrukları:
 
+- [x] `extraction`: triple çıkarma
 - [ ] `ingestion`: PDF, OCR, scraping ve metin temizleme
 - [ ] `chunking`: parent-child chunk üretimi
-- [ ] `extraction`: triple çıkarma
 - [ ] `verification`: RAG doğrulama
 - [ ] `consensus`: çoklu model değerlendirmesi
 - [ ] `publishing`: doğrulanmış triple'ları global KG'ye aktarma
 
 Zamanlanmış görevler:
 
-- [ ] Yarım kalan job'ları tespit etme
-- [ ] Başarısız job'ları sınırlı tekrar deneme
+- [ ] Yarım kalan (crash sonrası `running` durumunda takılı kalmış) job'ları tespit edip yeniden kuyruğa alma
+- [x] Başarısız job'ları sınırlı tekrar deneme (extraction worker içinde, geçici hatalar için — ayrı bir cron değil, task'ın kendi retry mekanizması)
 - [ ] Süresi geçmiş session ve cache kayıtlarını temizleme
 - [ ] Eski geçici dosyaları temizleme
 - [ ] OpenRouter model listesini güncelleme
@@ -273,7 +274,7 @@ Bu parametrelerden (`kg_type`, `prompt_type`, `embedding_model`, `ontology_langu
 
 `extraction_jobs` tablosu, worker'ın işi nasıl çalıştıracağını bilmesi için gönderilen tüm pipeline parametrelerini (`model`, `kg_type`, `prompt_type`, `embedding_model`, `ontology_language`) ve şemadaki `pipeline_version`'ı ayrı sütunlarda saklar; job cevabında bu alanlar da döner. Aynı doküman + aynı fingerprint için aktif (`queued`/`running`) birden fazla job açılmasını, uygulama kontrolüne ek olarak veritabanındaki kısmi unique index kesin olarak engeller; iki eşzamanlı istek çakışırsa ikincisi mevcut job'ı yeniden kullanır.
 
-Bu aşamada job'lar sadece kayda alınır; kuyruktan tüketilip işlenmesi (Celery worker) sonraki adımda eklenecektir.
+Job oluşturulduğunda (yeni bir kayıt açıldıysa) job kimliği Celery üzerinden `extraction-worker` container'ına gönderilir; işleme aşağıdaki "Extraction worker" bölümünde anlatılmaktadır.
 
 ## Triple ve provenance API'si
 
@@ -308,7 +309,49 @@ Triple cevabı, kaynak paragraf/cümle metnini ve doküman içindeki karakter ko
 }
 ```
 
-Triple oluşturma bu aşamada genel bir endpoint üzerinden yapılmaz; bu, extraction job'ı işleyecek worker'ın (sonraki adım) sonuçları doğrudan iç servis katmanı üzerinden kaydetmesi için ayrılmıştır. Tüm triple endpointleri, dokümanlar ve job'larla aynı çalışma alanı (workspace) erişim kontrolüne tabidir; başka bir kullanıcıya/ziyaretçiye ait triple'lara erişim `404` döner.
+Triple oluşturma genel bir endpoint üzerinden yapılmaz; bunun yerine extraction worker, işi tamamladığında sonuçları doğrudan iç servis katmanı (`triples.service`) üzerinden kaydeder. Tüm triple endpointleri, dokümanlar ve job'larla aynı çalışma alanı (workspace) erişim kontrolüne tabidir; başka bir kullanıcıya/ziyaretçiye ait triple'lara erişim `404` döner.
+
+## Extraction worker
+
+`POST /api/extraction-jobs` ile yeni bir job açıldığında, gateway job kimliğini (yalnızca kimliği — metin veya pipeline parametreleri değil) Redis üzerinden Celery kuyruğuna gönderir. Ayrı bir `extraction-worker` container'ı bu kuyruğu tüketir:
+
+```text
+POST /api/extraction-jobs
+        ↓
+PostgreSQL: queued
+        ↓
+Redis/Celery kuyruğu (yalnızca job_id taşınır)
+        ↓
+Worker job'ı atomik olarak sahiplenir (queued → running)
+        ↓
+extraction.service.run_extraction → Wikontic adapter'ı veya OpenRouter provider'ı çalıştırır
+        ↓
+Triple + evidence kaydeder (mevcut kayıtların yerine geçer)
+        ↓
+completed / failed
+```
+
+Mimari notları:
+
+- **Ortak extraction servisi.** `extraction/` paketi (`wikontic_adapter.py`, `openrouter_provider.py`, `service.py`) hem senkron `/api/extract` endpoint'i hem de worker tarafından kullanılır; iki kod yolu birbirinden sapmaz. `kg_type=wicontic` Wikontic adapter'ına, `kg_type` `wikipedia`/`kggen` ise OpenRouter provider'ına yönlenir.
+- **Atomik sahiplenme.** Worker bir job'ı işlemeden önce `UPDATE extraction_jobs SET status='running' WHERE id=... AND status='queued'` ile atomik olarak sahiplenir. Bu sorgu 0 satır etkilerse (başka bir worker zaten almış ya da job zaten `completed`/`failed`) worker sessizce çıkar — mesaj tekrar teslim edilse bile (Redis'in "en az bir kez teslim" garantisi) job iki kez işlenmez.
+- **İdempotent yazım.** Worker sonuçları yazarken o job'a ait önceki triple/evidence kayıtlarını silip yenilerini ekler (`triples.service.replace_triples_for_job`). Bir görev yarıda kalıp yeniden denendiğinde veya mesaj tekrar teslim edildiğinde triple'lar çoğalmaz.
+- **Durum geçişleri ve zaman damgaları.** `queued → running → completed` veya `queued → running → failed`. `started_at` sahiplenme anında, `completed_at` sonuç ne olursa olsun (başarı/başarısızlık) yazılır. Başarısızlıkta `error_message` insan tarafından okunabilir, güvenli (iç detay/secret sızdırmayan) bir mesajla doldurulur.
+- **Sınırlı retry.** Geçici hatalar (zaman aşımı, 5xx, ağ hatası) `EXTRACTION_JOB_MAX_RETRIES` (varsayılan 3) kez, `EXTRACTION_JOB_RETRY_BACKOFF_SECONDS` (varsayılan 30) bekleme ile tekrar denenir. Kalıcı hatalar (bilinmeyen `kg_type`, 4xx doğrulama hataları) hiç denenmeden `failed` olarak işaretlenir.
+- **Broker erişilemezse job kaybolmaz.** Job her zaman önce PostgreSQL'e `queued` olarak yazılır; Celery'ye gönderim (`.delay()`) ayrı bir adımdır ve başarısız olursa (broker geçici olarak erişilemezse) yalnızca loglanır — job satırı `queued` durumda kalıcı olarak durur ve API isteği yine de başarıyla döner. Bu job'ları otomatik olarak yeniden kuyruğa alan zamanlanmış görev (stale job sweep) henüz eklenmedi; bu iş "Worker ve cron işlemleri" bölümünde plânlanmıştır.
+- **Concurrency.** Worker container'ı `--concurrency=${CELERY_WORKER_CONCURRENCY:-2}` ile başlar.
+
+Ortam değişkenleri (`.env.example`):
+
+```env
+CELERY_WORKER_CONCURRENCY=2
+CELERY_TASK_TIME_LIMIT_SECONDS=300
+CELERY_TASK_SOFT_TIME_LIMIT_SECONDS=270
+EXTRACTION_JOB_MAX_RETRIES=3
+EXTRACTION_JOB_RETRY_BACKOFF_SECONDS=30
+```
+
+Testler: `tests/test_extraction.py` (adapter/provider/dispatch birim testleri), `tests/test_worker_tasks.py` (Celery `task_always_eager` ile başarı, tekrar teslimde no-op, yarıda kalan işin idempotent yeniden yazımı, kalıcı/geçici hata senaryoları) ve `tests/test_worker_redis_integration.py` (gerçek bir Redis broker'a karşı `celery.contrib.testing.worker.start_worker` ile uçtan uca job teslimi — Redis erişilemezse otomatik `skip` edilir, `REDIS_TEST_URL` ile hedef broker değiştirilebilir).
 
 ## Middleware davranışı
 
