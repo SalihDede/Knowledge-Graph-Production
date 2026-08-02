@@ -23,9 +23,48 @@ services:
       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
       WIKONTIC_URL: http://wikontic:8001
       WIKONTIC_TIMEOUT_SECONDS: ${WIKONTIC_TIMEOUT_SECONDS:-170}
+      AUTH_ENABLED: "true"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kg}:${POSTGRES_PASSWORD:-kg}@postgres:5432/${POSTGRES_DB:-knowledge_graph}
+      REDIS_URL: redis://redis:6379/0
+      AUTH_COOKIE_SECRET: ${AUTH_COOKIE_SECRET:-development-only-change-this-cookie-secret}
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      AUTH_COOKIE_DOMAIN: ${AUTH_COOKIE_DOMAIN:-}
+      AUTH_SESSION_TTL_SECONDS: ${AUTH_SESSION_TTL_SECONDS:-2592000}
+      AUTH_VISITOR_TTL_SECONDS: ${AUTH_VISITOR_TTL_SECONDS:-7776000}
     depends_on:
       wikontic:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-knowledge_graph}
+      POSTGRES_USER: ${POSTGRES_USER:-kg}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kg}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kg} -d ${POSTGRES_DB:-knowledge_graph}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
 
   wikontic:
     build:
@@ -81,6 +120,8 @@ services:
       retries: 12
 
 volumes:
+  postgres_data:
+  redis_data:
   wikontic_mongo_data:
   wikontic_mongo_config:
   wikontic_models:

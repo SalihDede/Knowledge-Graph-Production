@@ -4,6 +4,7 @@ import GraphCanvas from './GraphCanvas'
 import ResultCard  from './ResultCard'
 import TripleComparisonTable from './TripleComparisonTable'
 import SourceProvenanceGraph from './SourceProvenanceGraph'
+import AuthPanel from './AuthPanel'
 import { downloadJson, downloadText, parseImportedTriples } from './utils/triplesIO'
 import {
   LANGUAGE_OPTIONS,
@@ -365,6 +366,8 @@ function App() {
   const [selectedPrompt, setSelectedPrompt] = useState('temel')
   const [selectedEmbedding, setSelectedEmbedding] = useState('contriever')
   const [selectedOntologyLanguage, setSelectedOntologyLanguage] = useState('en')
+  const [identity, setIdentity] = useState(null)
+  const [authOpen, setAuthOpen] = useState(false)
   const referenceInputRef = useRef(null)
   const wiconticSettingsRef = useRef(null)
   const previousKgRef = useRef(selectedKg)
@@ -377,6 +380,17 @@ function App() {
       .then(data => {
         setModels(data)
         if (data.length > 0) setModel(data[0].id)
+      })
+  }, [])
+
+  useEffect(() => {
+    fetch('/api/auth/me', { credentials: 'same-origin' })
+      .then(response => response.ok ? response.json() : null)
+      .then(data => {
+        if (data) setIdentity(data)
+      })
+      .catch(() => {
+        // Auth is optional while the local API is being started.
       })
   }, [])
 
@@ -678,6 +692,13 @@ function App() {
   return (
     <div className="app-shell">
       <GraphCanvas groups={graphGroups} hidden={isActive} />
+      <AuthPanel
+        open={authOpen}
+        onClose={() => setAuthOpen(false)}
+        identity={identity}
+        onIdentityChange={setIdentity}
+        t={t}
+      />
 
       <aside className="studio-sidebar" aria-label={t.app.sidebarAria}>
         <div className="brand-lockup">
@@ -899,6 +920,17 @@ function App() {
             ))}
           </nav>
           <div className="topbar-actions">
+            <button className="account-button" type="button" onClick={() => setAuthOpen(true)}>
+              <span className="account-button-avatar" aria-hidden="true">
+                {identity?.authenticated
+                  ? identity.user.display_name.slice(0, 1).toUpperCase()
+                  : 'G'}
+              </span>
+              <span>
+                <small>{identity?.authenticated ? t.auth.account : t.auth.anonymousSession}</small>
+                <strong>{identity?.authenticated ? identity.user.display_name : t.auth.guest}</strong>
+              </span>
+            </button>
             <div className="language-toggle" role="group" aria-label={t.language.ariaLabel}>
               {LANGUAGE_OPTIONS.map(option => (
                 <button

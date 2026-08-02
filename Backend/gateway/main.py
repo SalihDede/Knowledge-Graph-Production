@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from accounts import install_accounts
+from accounts.setup import accounts_ready
 from visualization import build_graph_html, build_source_graph_html
 from llm import extract_triplets
 from prompts import extract_with_ape, extract_with_dspy, extract_with_textgrad
@@ -26,7 +28,10 @@ app.add_middleware(
     allow_origins=["http://localhost:5173"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    allow_credentials=True,
 )
+
+install_accounts(app)
 
 BASE_DIR       = os.path.dirname(__file__)
 MODELS_FILE    = os.path.join(BASE_DIR, "allowedOpenroutherLLMModels.json")
@@ -60,6 +65,13 @@ async def ready():
         raise
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=503, detail=f"Wikontic is unavailable: {exc}")
+    try:
+        if not await accounts_ready(app):
+            raise HTTPException(status_code=503, detail="Account services are unavailable")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Account services are unavailable: {exc}")
     return {"status": "ok", "service": "backend", "wikontic": "ready"}
 
 
