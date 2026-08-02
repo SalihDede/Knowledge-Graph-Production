@@ -16,6 +16,7 @@ from triples.service import build_triple_inputs_from_raw, replace_triples_for_jo
 
 from .celery_app import celery_app
 from .db import build_session_factory
+from .recovery import sweep_stale_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -140,3 +141,22 @@ def run_extraction_job(self, job_id: str) -> None:
             # self.retry() re-raises the original exception once max_retries
             # is exhausted instead of a distinct "exceeded" error.
             asyncio.run(_mark_failed_standalone(uuid.UUID(job_id), exc.safe_message))
+
+
+async def _sweep_and_dispose() -> dict:
+    engine, sessions = build_session_factory()
+    try:
+        return await sweep_stale_jobs(sessions)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task
+def recover_stale_jobs() -> None:
+    """Celery Beat entrypoint. Beat only schedules this task; it runs on
+    whichever extraction-worker process consumes it off the queue, which is
+    the process that actually touches the database and re-dispatches
+    recovered jobs."""
+    result = asyncio.run(_sweep_and_dispose())
+    for job_id in result["requeued"]:
+        run_extraction_job.delay(str(job_id))

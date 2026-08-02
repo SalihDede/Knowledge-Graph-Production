@@ -57,6 +57,8 @@ class ExtractionJobResponse(BaseModel):
     pipeline_fingerprint: str
     result: dict | None
     error_message: str | None
+    recovery_attempts: int
+    last_recovery_at: datetime | None
     created_at: datetime
     started_at: datetime | None
     completed_at: datetime | None

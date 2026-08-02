@@ -21,6 +21,12 @@ celery_app.conf.update(
     task_soft_time_limit=int(os.getenv("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS", "270")),
     worker_concurrency=int(os.getenv("CELERY_WORKER_CONCURRENCY", "2")),
     timezone="UTC",
+    beat_schedule={
+        "recover-stale-extraction-jobs": {
+            "task": "worker.tasks.recover_stale_jobs",
+            "schedule": float(os.getenv("JOB_RECOVERY_SWEEP_SECONDS", "60")),
+        },
+    },
 )
 
 # Imported for its side effect: registers run_extraction_job on this app.

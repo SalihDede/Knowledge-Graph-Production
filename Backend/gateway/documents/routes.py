@@ -74,6 +74,8 @@ def _job_response(job: ExtractionJob) -> ExtractionJobResponse:
         pipeline_fingerprint=job.pipeline_fingerprint,
         result=job.result,
         error_message=job.error_message,
+        recovery_attempts=job.recovery_attempts,
+        last_recovery_at=job.last_recovery_at,
         created_at=job.created_at,
         started_at=job.started_at,
         completed_at=job.completed_at,

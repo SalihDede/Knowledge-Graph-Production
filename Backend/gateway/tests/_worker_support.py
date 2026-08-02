@@ -6,6 +6,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from accounts.models import AnonymousVisitor
 from documents import service as documents_service
 from documents.models import ExtractionJob
 from triples.models import Triple
@@ -20,6 +21,11 @@ def create_document_and_job(
 
     async def scenario() -> tuple[str, str]:
         async with sessions() as db:
+            # SQLite doesn't enforce foreign keys by default, but PostgreSQL
+            # does: the workspace's owner_visitor_id must reference a real row.
+            db.add(AnonymousVisitor(id=visitor_id))
+            await db.commit()
+
             workspace = await documents_service.get_or_create_workspace(
                 db, user=None, visitor_id=visitor_id
             )
