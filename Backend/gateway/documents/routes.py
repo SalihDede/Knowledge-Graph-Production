@@ -5,6 +5,7 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
+import policy
 from accounts.runtime import AuthRuntime
 from worker.tasks import run_extraction_job
 from . import service
@@ -139,6 +140,18 @@ async def create_extraction_job(
     user, visitor_id = _identity(request)
     document_id = _parse_uuid(body.document_id)
 
+    try:
+        policy.validate_pipeline(
+            model=body.model,
+            kg_type=body.kg_type,
+            prompt_type=body.prompt_type,
+            embedding_model=body.embedding_model,
+            ontology_language=body.ontology_language,
+            is_anonymous=user is None,
+        )
+    except policy.PolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
     async with runtime.sessions() as db:
         document = await service.get_accessible_document(
             db, document_id=document_id, user=user, visitor_id=visitor_id
@@ -146,17 +159,20 @@ async def create_extraction_job(
         if document is None:
             raise HTTPException(status_code=404, detail="Doküman bulunamadı")
 
-        job, created = await service.create_or_reuse_extraction_job(
-            db,
-            document=document,
-            user=user,
-            visitor_id=visitor_id,
-            kg_type=body.kg_type,
-            prompt_type=body.prompt_type,
-            embedding_model=body.embedding_model,
-            ontology_language=body.ontology_language,
-            model=body.model,
-        )
+        try:
+            job, created = await service.create_or_reuse_extraction_job(
+                db,
+                document=document,
+                user=user,
+                visitor_id=visitor_id,
+                kg_type=body.kg_type,
+                prompt_type=body.prompt_type,
+                embedding_model=body.embedding_model,
+                ontology_language=body.ontology_language,
+                model=body.model,
+            )
+        except policy.ActiveJobLimitExceeded as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     if created:
         job_id = str(job.id)

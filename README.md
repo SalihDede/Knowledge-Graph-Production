@@ -75,7 +75,7 @@ Platform anonymous-first çalışacaktır. Kullanıcı giriş yapmadan triple ç
 - [x] Session doğrulama ve kullanıcı context'i
 - [x] Güvenli upstream timeout yönetimi
 - [x] Redis tabanlı rate limit
-- [ ] Extraction concurrency limiti
+- [x] Extraction concurrency limiti (workspace başına maksimum eşzamanlı `queued`/`running` job)
 - [x] Hash tabanlı duplicate kontrolü
 - [x] Devam eden aynı işlemin tekrar başlatılmasını engelleme
 - [x] Unit ve integration testleri
@@ -105,14 +105,14 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 
 Mevcut gateway korunacak ve modüler bir yapıya ayrılacaktır.
 
-- [ ] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları (auth, documents, extraction-jobs ve triples tamamlandı; models bekliyor)
+- [x] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları (`models` artık ayrı bir `catalog` modülünde)
 - [ ] Text, PDF ve URL girişlerini ortak doküman modeline dönüştürme (ilk aşamada yalnızca düz metin destekleniyor)
 - [x] Doküman hash'i ve pipeline fingerprint üretme
 - [x] Extraction job oluşturma
 - [x] Job'a tüm pipeline parametrelerini (model, kg_type, prompt_type, embedding_model, ontology_language) ve pipeline_version'ı kaydetme
 - [x] Wikontic adapter katmanı
 - [x] OpenRouter provider katmanı
-- [ ] Model ve prompt ayarlarını doğrulama
+- [x] Model ve prompt ayarlarını doğrulama (OpenRouter allow-list + kg_type/prompt_type/embedding_model/ontology_language kombinasyon kontrolü, bkz. "Extraction policy" bölümü)
 - [x] Triple ve provenance kaydı
 - [x] Candidate, verified ve rejected durumları
 - [ ] RAG doğrulama akışı
@@ -275,6 +275,46 @@ Bu parametrelerden (`kg_type`, `prompt_type`, `embedding_model`, `ontology_langu
 `extraction_jobs` tablosu, worker'ın işi nasıl çalıştıracağını bilmesi için gönderilen tüm pipeline parametrelerini (`model`, `kg_type`, `prompt_type`, `embedding_model`, `ontology_language`) ve şemadaki `pipeline_version`'ı ayrı sütunlarda saklar; job cevabında bu alanlar da döner. Aynı doküman + aynı fingerprint için aktif (`queued`/`running`) birden fazla job açılmasını, uygulama kontrolüne ek olarak veritabanındaki kısmi unique index kesin olarak engeller; iki eşzamanlı istek çakışırsa ikincisi mevcut job'ı yeniden kullanır.
 
 Job oluşturulduğunda (yeni bir kayıt açıldıysa) job kimliği Celery üzerinden `extraction-worker` container'ına gönderilir; işleme aşağıdaki "Extraction worker" bölümünde anlatılmaktadır.
+
+Job oluşturmadan önce istek "Extraction policy" bölümünde açıklanan kontrollerden geçer: geçersiz `kg_type`/`prompt_type`/`embedding_model`/`ontology_language` veya izin verilmeyen `model` `422` ile, çalışma alanı başına aktif iş limiti aşımı `429` ile reddedilir — bu durumlarda job hiç oluşturulmaz.
+
+## Extraction policy
+
+API'ye keyfi bir OpenRouter modeli, pipeline kombinasyonu veya sınırsız sayıda eşzamanlı iş gönderilmesini engelleyen bir koruma katmanı vardır. Bu kontroller hem `POST /api/extract` hem de `POST /api/extraction-jobs` için geçerlidir ve `Backend/gateway/policy.py` + `Backend/gateway/catalog/` içinde toplanmıştır.
+
+Model kataloğu artık ayrı bir modülde:
+
+```text
+GET /api/models
+```
+
+`allowedOpenroutherLLMModels.json` içindeki liste, izin verilen OpenRouter modellerinin tek doğruluk kaynağıdır (allow-list). Gönderilen `model` bu listede yoksa istek `422` ile reddedilir.
+
+Anonim (giriş yapmamış) ziyaretçiler için ayrıca daha dar bir alt küme uygulanır — maliyet kontrolü amacıyla, kayıtlı kullanıcı olmayan biri yalnızca `ANONYMOUS_MODEL_ALLOWLIST` içindeki modelleri kullanabilir (varsayılan: tek, ucuz bir model). Bu liste her zaman tam kataloğun bir alt kümesidir; env değişkeni yanlışlıkla kataloğa hiç girmemiş bir model id'si içerse bile o id yok sayılır.
+
+Pipeline kombinasyonu doğrulaması:
+
+- `kg_type`: `wikipedia`, `wicontic`, `kggen`
+- `prompt_type`: `temel`, `ape`, `dspy`, `textgrad`
+- `embedding_model`: `contriever`, `bge_m3`, `turkish_e5_large`, `turkish_sbert_mean_nli_stsb`, `mft_random`
+- `ontology_language`: `en`, `tr`
+
+Bu kümelerin dışında bir değer, ya da izin verilmeyen bir `model`, job/extract isteğini `422` ile reddeder — job hiçbir zaman oluşturulmaz.
+
+Metin uzunluğu ve iş kotası:
+
+- `MAX_EXTRACTION_CHARS` (varsayılan `100000`): hem `POST /api/documents` (pydantic `max_length` ile) hem `POST /api/extract` bu sınırı aşan metni `422` ile reddeder.
+- `MAX_ACTIVE_JOBS_PER_WORKSPACE` (varsayılan `3`): bir çalışma alanının aynı anda sahip olabileceği `queued`/`running` job sayısının üst sınırıdır. Zaten var olan bir job'ın yeniden kullanılması (dedup) bu sayaca dahil değildir — yalnızca gerçekten yeni bir job açmaya çalışan istekler sayılır ve limit aşıldığında `429` döner. Bu, uygulama seviyesinde bir kontrol say/ekle sırasına dayanır (yarış koşulunda küçük bir toleransla) — kesin bir veritabanı kısıtı değildir; amaç kötüye kullanımı/maliyeti sınırlamaktır, tam bir eşzamanlılık garantisi değildir.
+
+Ortam değişkenleri (`.env.example`):
+
+```env
+MAX_EXTRACTION_CHARS=100000
+MAX_ACTIVE_JOBS_PER_WORKSPACE=3
+ANONYMOUS_MODEL_ALLOWLIST=google/gemini-2.5-flash-lite
+```
+
+Testler: `tests/test_policy.py` (allow-list, anonim alt küme, pipeline doğrulama, metin uzunluğu — birim testleri), `tests/test_catalog.py` (`/api/models` sözleşmesi), `tests/test_documents.py` ve `tests/test_api.py` içindeki uçtan uca `422`/`429` senaryoları.
 
 ## Triple ve provenance API'si
 

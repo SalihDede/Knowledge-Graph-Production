@@ -1,8 +1,7 @@
-import json
 import logging
 import os
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, field_validator
@@ -12,6 +11,7 @@ load_dotenv()
 
 from accounts import install_accounts
 from accounts.setup import accounts_ready
+from catalog import install_catalog
 from documents import install_documents
 from triples import install_triples
 from gateway_middleware import (
@@ -22,6 +22,7 @@ from gateway_middleware import (
 from gateway_middleware.context import request_id_context
 from visualization import build_graph_html, build_source_graph_html
 from extraction import ExtractionError, run_extraction
+from policy import PolicyError, validate_pipeline, validate_text_length
 
 logger = logging.getLogger(__name__)
 middleware_settings = MiddlewareSettings.from_env()
@@ -38,11 +39,10 @@ app.add_middleware(
 accounts_runtime = install_accounts(app)
 install_documents(app, accounts_runtime)
 install_triples(app, accounts_runtime)
+install_catalog(app)
 install_error_handlers(app)
 install_platform_middleware(app, middleware_settings)
 
-BASE_DIR       = os.path.dirname(__file__)
-MODELS_FILE    = os.path.join(BASE_DIR, "allowedOpenroutherLLMModels.json")
 WIKONTIC_URL   = os.getenv("WIKONTIC_URL", "http://localhost:8001")
 
 
@@ -74,14 +74,6 @@ async def ready():
     return {"status": "ok", "service": "backend", "wikontic": "ready"}
 
 
-# ── Models ────────────────────────────────────────────────────────────────────
-
-@app.get("/api/models")
-def get_models():
-    with open(MODELS_FILE, encoding="utf-8") as f:
-        return json.load(f)
-
-
 # ── Extraction ────────────────────────────────────────────────────────────────
 
 class ExtractRequest(BaseModel):
@@ -101,7 +93,21 @@ class ExtractRequest(BaseModel):
 
 
 @app.post("/api/extract")
-async def extract(body: ExtractRequest):
+async def extract(body: ExtractRequest, request: Request):
+    is_anonymous = getattr(request.state, "user", None) is None
+    try:
+        validate_text_length(body.text)
+        validate_pipeline(
+            model=body.model,
+            kg_type=body.kg_type,
+            prompt_type=body.prompt_type,
+            embedding_model=body.embedding_model,
+            ontology_language=body.ontology_language,
+            is_anonymous=is_anonymous,
+        )
+    except PolicyError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
     try:
         triplets = await run_extraction(
             text=body.text,

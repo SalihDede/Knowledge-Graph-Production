@@ -74,6 +74,56 @@ def test_extract_rejects_blank_text() -> None:
     assert response.json()["error"]["request_id"].startswith("req_")
 
 
+def test_extract_rejects_disallowed_model_without_calling_provider(monkeypatch) -> None:
+    called = False
+
+    async def should_not_run(**kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(main, "run_extraction", should_not_run)
+    response = client.post(
+        "/api/extract",
+        json={
+            "text": "Herhangi bir metin.",
+            "model": "not-a-real-model",
+            "kg_type": "wicontic",
+        },
+    )
+
+    assert response.status_code == 422
+    assert called is False
+
+
+def test_extract_rejects_unknown_kg_type() -> None:
+    response = client.post(
+        "/api/extract",
+        json={
+            "text": "Herhangi bir metin.",
+            "model": "google/gemini-2.5-flash-lite",
+            "kg_type": "not-a-real-kg-type",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_extract_rejects_text_over_max_length() -> None:
+    import policy
+
+    response = client.post(
+        "/api/extract",
+        json={
+            "text": "a" * (policy.MAX_EXTRACTION_CHARS + 1),
+            "model": "google/gemini-2.5-flash-lite",
+            "kg_type": "wicontic",
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_visualization_contracts_return_html(monkeypatch) -> None:
     monkeypatch.setattr(main, "build_graph_html", lambda *args, **kwargs: "<html>graph</html>")
     monkeypatch.setattr(main, "build_source_graph_html", lambda *args, **kwargs: "<html>source</html>")

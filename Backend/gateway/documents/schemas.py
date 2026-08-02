@@ -4,11 +4,12 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
+import policy
 from .models import JobStatus
 
 
 class DocumentCreateRequest(BaseModel):
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=policy.MAX_EXTRACTION_CHARS)
     title: str | None = Field(default=None, max_length=255)
 
     @field_validator("text")
