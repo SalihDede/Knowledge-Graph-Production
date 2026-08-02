@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import policy
 from accounts.models import User
 from .models import Document, ExtractionJob, JobStatus, Workspace
 from .normalization import (
@@ -16,6 +17,7 @@ from .normalization import (
 )
 
 REUSABLE_JOB_STATUSES = (JobStatus.queued, JobStatus.running, JobStatus.completed)
+ACTIVE_JOB_STATUSES = (JobStatus.queued, JobStatus.running)
 
 
 async def get_or_create_workspace(
@@ -150,6 +152,18 @@ async def _find_reusable_job(
     )
 
 
+async def count_active_jobs(db: AsyncSession, *, workspace_id: uuid.UUID) -> int:
+    count = await db.scalar(
+        select(func.count())
+        .select_from(ExtractionJob)
+        .where(
+            ExtractionJob.workspace_id == workspace_id,
+            ExtractionJob.status.in_(ACTIVE_JOB_STATUSES),
+        )
+    )
+    return count or 0
+
+
 async def create_or_reuse_extraction_job(
     db: AsyncSession,
     *,
@@ -175,6 +189,10 @@ async def create_or_reuse_extraction_job(
     existing = await _find_reusable_job(db, document_id=document_id, fingerprint=fingerprint)
     if existing is not None:
         return existing, False
+
+    active_count = await count_active_jobs(db, workspace_id=workspace_id)
+    if active_count >= policy.MAX_ACTIVE_JOBS_PER_WORKSPACE:
+        raise policy.ActiveJobLimitExceeded(policy.MAX_ACTIVE_JOBS_PER_WORKSPACE)
 
     job = ExtractionJob(
         document_id=document_id,

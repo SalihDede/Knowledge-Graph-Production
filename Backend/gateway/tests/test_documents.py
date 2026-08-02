@@ -41,12 +41,7 @@ class MemorySessionStore:
         return True
 
 
-@pytest.fixture()
-def documents_app(tmp_path: Path, monkeypatch):
-    # These tests exercise the HTTP layer, not the Celery dispatch; avoid a real
-    # (and here, unreachable) broker call on every job-creation test.
-    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
-
+def _build_documents_app(tmp_path: Path):
     database_path = tmp_path / "documents.sqlite3"
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{database_path}", connect_args={"timeout": 30}
@@ -82,6 +77,30 @@ def documents_app(tmp_path: Path, monkeypatch):
     app.add_middleware(IdentityMiddleware, runtime=runtime)
     app.include_router(auth_router)
     app.include_router(documents_router)
+    return app, runtime, engine
+
+
+@pytest.fixture()
+def documents_app(tmp_path: Path, monkeypatch):
+    # These tests exercise the HTTP layer, not the Celery dispatch; avoid a real
+    # (and here, unreachable) broker call on every job-creation test.
+    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+    # These tests use placeholder model ids; the OpenRouter allow-list is
+    # covered separately in tests/test_policy.py and below via strict_documents_app.
+    monkeypatch.setattr("catalog.registry.is_model_allowed", lambda *a, **kw: True)
+
+    app, runtime, engine = _build_documents_app(tmp_path)
+    yield app, runtime
+    asyncio.run(engine.dispose())
+
+
+@pytest.fixture()
+def strict_documents_app(tmp_path: Path, monkeypatch):
+    # Same as documents_app but with the real OpenRouter allow-list enforced,
+    # for testing extraction policy rejections end-to-end.
+    monkeypatch.setattr(documents_routes.run_extraction_job, "delay", lambda *a, **kw: None)
+
+    app, runtime, engine = _build_documents_app(tmp_path)
     yield app, runtime
     asyncio.run(engine.dispose())
 
@@ -283,3 +302,124 @@ def test_login_migrates_anonymous_workspace_to_user(documents_app) -> None:
         after_login = client.get(f"/api/documents/{document_id}")
 
     assert after_login.status_code == 200
+
+
+def test_create_document_rejects_text_over_max_length(documents_app) -> None:
+    import policy
+
+    app, _ = documents_app
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/documents",
+            json={"text": "a" * (policy.MAX_EXTRACTION_CHARS + 1)},
+        )
+
+    assert response.status_code == 422
+
+
+ALLOWED_MODEL = "google/gemini-2.5-flash-lite"
+ANOTHER_ALLOWED_MODEL = "openai/gpt-4o-mini"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("kg_type", "not-a-real-kg-type"),
+        ("prompt_type", "not-a-real-prompt-type"),
+        ("embedding_model", "not-a-real-embedding-model"),
+        ("ontology_language", "fr"),
+    ],
+)
+def test_create_extraction_job_rejects_invalid_pipeline_field(
+    strict_documents_app, field: str, value: str
+) -> None:
+    app, _ = strict_documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Policy testi."}).json()
+        payload = {
+            "document_id": document["id"],
+            "model": ALLOWED_MODEL,
+            "prompt_type": "temel",
+            "kg_type": "wikipedia",
+            "embedding_model": "contriever",
+            "ontology_language": "en",
+        }
+        payload[field] = value
+
+        response = client.post("/api/extraction-jobs", json=payload)
+
+    assert response.status_code == 422
+
+
+def test_create_extraction_job_rejects_model_outside_full_catalog(strict_documents_app) -> None:
+    app, _ = strict_documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Model testi."}).json()
+
+        response = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": "not-a-real-model"},
+        )
+
+    assert response.status_code == 422
+
+
+def test_create_extraction_job_rejects_model_outside_anonymous_allowlist(
+    strict_documents_app, monkeypatch
+) -> None:
+    monkeypatch.delenv("ANONYMOUS_MODEL_ALLOWLIST", raising=False)
+    app, _ = strict_documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Anonim model testi."}).json()
+
+        response = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": ANOTHER_ALLOWED_MODEL},
+        )
+
+    assert response.status_code == 422
+
+
+def test_create_extraction_job_allows_default_anonymous_model(
+    strict_documents_app, monkeypatch
+) -> None:
+    monkeypatch.delenv("ANONYMOUS_MODEL_ALLOWLIST", raising=False)
+    app, _ = strict_documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Anonim model testi 2."}).json()
+
+        response = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": ALLOWED_MODEL},
+        )
+
+    assert response.status_code == 201
+
+
+def test_create_extraction_job_enforces_active_job_limit_per_workspace(
+    strict_documents_app,
+) -> None:
+    import policy
+
+    app, _ = strict_documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Kota testi."}).json()
+
+        responses = []
+        for index in range(policy.MAX_ACTIVE_JOBS_PER_WORKSPACE + 1):
+            responses.append(
+                client.post(
+                    "/api/extraction-jobs",
+                    json={
+                        "document_id": document["id"],
+                        "model": ALLOWED_MODEL,
+                        # Distinct prompt_type per request avoids job dedup so
+                        # each call actually tries to open a *new* job.
+                        "prompt_type": ["temel", "ape", "dspy", "textgrad"][index],
+                    },
+                )
+            )
+
+    statuses = [response.status_code for response in responses]
+    assert statuses[: policy.MAX_ACTIVE_JOBS_PER_WORKSPACE] == [201] * policy.MAX_ACTIVE_JOBS_PER_WORKSPACE
+    assert statuses[-1] == 429
