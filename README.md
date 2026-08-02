@@ -10,6 +10,7 @@ Metin, PDF ve web kaynaklarından bilgi grafiği çıkarmak; üretilen triple'la
 - OpenRouter üzerinden model çağrısı yapılabiliyor.
 - MongoDB Atlas Local üzerinde Wikontic ontology ve embedding indeksleri bulunuyor.
 - Extraction job'ları artık ayrı bir Celery worker container'ında, Redis kuyruğu üzerinden asenkron işleniyor.
+- Ayrı bir Celery Beat container'ı, kaybolan/takılı kalan job'ları periyodik olarak tarayıp kurtarıyor.
 - Docker Compose ile mevcut sistem ayağa kaldırılabiliyor.
 
 ## Hedef mimari
@@ -166,8 +167,8 @@ Worker kuyrukları:
 
 Zamanlanmış görevler:
 
-- [ ] Yarım kalan (crash sonrası `running` durumunda takılı kalmış) job'ları tespit edip yeniden kuyruğa alma
-- [x] Başarısız job'ları sınırlı tekrar deneme (extraction worker içinde, geçici hatalar için — ayrı bir cron değil, task'ın kendi retry mekanizması)
+- [x] Yarım kalan (crash sonrası `running` durumunda takılı kalmış) veya hiç gönderilememiş (`queued` durumunda takılı kalmış) job'ları tespit edip yeniden kuyruğa alma — Celery Beat, bkz. "Job recovery scheduler"
+- [x] Başarısız job'ları sınırlı tekrar deneme (hem worker içindeki geçici-hata retry'ı, hem recovery scheduler'ın `JOB_RECOVERY_MAX_ATTEMPTS` sınırı)
 - [ ] Süresi geçmiş session ve cache kayıtlarını temizleme
 - [ ] Eski geçici dosyaları temizleme
 - [ ] OpenRouter model listesini güncelleme
@@ -378,7 +379,7 @@ Mimari notları:
 - **İdempotent yazım.** Worker sonuçları yazarken o job'a ait önceki triple/evidence kayıtlarını silip yenilerini ekler (`triples.service.replace_triples_for_job`). Bir görev yarıda kalıp yeniden denendiğinde veya mesaj tekrar teslim edildiğinde triple'lar çoğalmaz.
 - **Durum geçişleri ve zaman damgaları.** `queued → running → completed` veya `queued → running → failed`. `started_at` sahiplenme anında, `completed_at` sonuç ne olursa olsun (başarı/başarısızlık) yazılır. Başarısızlıkta `error_message` insan tarafından okunabilir, güvenli (iç detay/secret sızdırmayan) bir mesajla doldurulur.
 - **Sınırlı retry.** Geçici hatalar (zaman aşımı, 5xx, ağ hatası) `EXTRACTION_JOB_MAX_RETRIES` (varsayılan 3) kez, `EXTRACTION_JOB_RETRY_BACKOFF_SECONDS` (varsayılan 30) bekleme ile tekrar denenir. Kalıcı hatalar (bilinmeyen `kg_type`, 4xx doğrulama hataları) hiç denenmeden `failed` olarak işaretlenir.
-- **Broker erişilemezse job kaybolmaz.** Job her zaman önce PostgreSQL'e `queued` olarak yazılır; Celery'ye gönderim (`.delay()`) ayrı bir adımdır ve başarısız olursa (broker geçici olarak erişilemezse) yalnızca loglanır — job satırı `queued` durumda kalıcı olarak durur ve API isteği yine de başarıyla döner. Bu job'ları otomatik olarak yeniden kuyruğa alan zamanlanmış görev (stale job sweep) henüz eklenmedi; bu iş "Worker ve cron işlemleri" bölümünde plânlanmıştır.
+- **Broker erişilemezse job kaybolmaz.** Job her zaman önce PostgreSQL'e `queued` olarak yazılır; Celery'ye gönderim (`.delay()`) ayrı bir adımdır ve başarısız olursa (broker geçici olarak erişilemezse) yalnızca loglanır — job satırı `queued` durumda kalıcı olarak durur ve API isteği yine de başarıyla döner. Bu job'lar ve çökmüş worker'lar yüzünden `running`'de takılı kalan job'lar, ayrı bir Celery Beat container'ının periyodik taramasıyla otomatik olarak kurtarılır; bkz. "Job recovery scheduler" bölümü.
 - **Concurrency.** Worker container'ı `--concurrency=${CELERY_WORKER_CONCURRENCY:-2}` ile başlar.
 
 Ortam değişkenleri (`.env.example`):
@@ -392,6 +393,43 @@ EXTRACTION_JOB_RETRY_BACKOFF_SECONDS=30
 ```
 
 Testler: `tests/test_extraction.py` (adapter/provider/dispatch birim testleri), `tests/test_worker_tasks.py` (Celery `task_always_eager` ile başarı, tekrar teslimde no-op, yarıda kalan işin idempotent yeniden yazımı, kalıcı/geçici hata senaryoları) ve `tests/test_worker_redis_integration.py` (gerçek bir Redis broker'a karşı `celery.contrib.testing.worker.start_worker` ile uçtan uca job teslimi — Redis erişilemezse otomatik `skip` edilir, `REDIS_TEST_URL` ile hedef broker değiştirilebilir).
+
+## Job recovery scheduler
+
+Extraction worker altyapısının kapattığı iki risk hâlâ açıktı: Redis broker geçici olarak kapalıyken oluşturulan bir job'un mesajı hiç yayınlanamayabilir (`queued` durumunda sonsuza dek takılı kalır), ve worker bir job'ı işlerken çökerse job `running` durumunda asılı kalabilir. Ayrı bir `celery-beat` container'ı, periyodik bir tarama görevi (`worker.tasks.recover_stale_jobs`) ile bu iki durumu tespit edip kurtarır:
+
+```text
+Celery Beat  (JOB_RECOVERY_SWEEP_SECONDS'te bir tetikler)
+    ↓
+recover_stale_jobs task'ı  (bir extraction-worker sürecinde çalışır)
+    ↓
+Stale job taraması (worker/recovery.py::sweep_stale_jobs)
+    ├── queued ama QUEUED_JOB_STALE_SECONDS'ten uzun süredir bekliyor → yeniden enqueue
+    └── running ama RUNNING_JOB_STALE_SECONDS'ten uzun süredir başlamış → queued'a al → yeniden enqueue
+```
+
+Mimari notları:
+
+- **Beat yalnızca zamanlayıcı.** `celery-beat` container'ı veritabanına hiç dokunmaz; sadece `recover_stale_jobs` görevini Redis kuyruğuna belirli aralıklarla yayınlar. Görevin kendisi, normal extraction job'ları gibi mevcut `extraction-worker` süreçlerinden biri tarafından tüketilir ve gerçek veritabanı işini orada yapar.
+- **Atomik ve tekilleştirilmiş seçim.** `sweep_stale_jobs`, aday satırları `SELECT ... FOR UPDATE SKIP LOCKED` ile kilitler (`JOB_RECOVERY_BATCH_SIZE` kadar, en eski önce). Aynı anda ikinci bir Beat/worker replikası aynı taramayı çalıştırırsa, kilitli satırları atlar — aynı job iki scheduler tarafından aynı anda kurtarılamaz. (SQLite bu kilidi no-op'a çevirir; birim testleri onun üzerinden çalışır, gerçek kilitleme davranışı ayrı bir PostgreSQL entegrasyon testiyle doğrulanır.)
+- **Sınırlı deneme sayısı.** Her job'un kendi `recovery_attempts` sayacı vardır. Bir kurtarma denemesi bu sayacı `JOB_RECOVERY_MAX_ATTEMPTS`'i aşacaksa job yeniden kuyruğa alınmaz; bunun yerine doğrudan `failed` yapılır ve `error_message` alanına güvenli, sabit bir mesaj yazılır — sürekli sorun çıkaran bir job sonsuza dek denenmez.
+- **Duplicate triple üretmez.** Kurtarma yalnızca job'un `status`/`started_at` alanlarını sıfırlar; gerçek yeniden işleme, worker'ın zaten idempotent olan `replace_triples_for_job` (sil-ve-yeniden-yaz) akışından geçer, bu yüzden bir job kaç kez kurtarılırsa kurtarılsın triple çoğalmaz.
+- **Log korelasyonu.** Her tarama turu bir `sweep_id` (uuid4) üretir; o turda kurtarılan/başarısız sayılan her job, log satırında hem kendi `job_id`'si hem de bu ortak `sweep_id` ile birlikte görünür.
+- **Bilinen sınır.** Gerçekten uzun süren meşru bir extraction (ör. çok büyük bir doküman), `RUNNING_JOB_STALE_SECONDS`'i aşarsa yanlışlıkla "çökmüş" sayılıp kurtarılabilir. Varsayılan değer (600 sn) bunu nadir kılacak şekilde seçildi; worker'dan gerçek bir heartbeat sinyali bu sınırı tamamen ortadan kaldırır ama bu görevin kapsamı dışında bırakıldı.
+
+Ortam değişkenleri (`.env.example`):
+
+```env
+JOB_RECOVERY_SWEEP_SECONDS=60
+QUEUED_JOB_STALE_SECONDS=120
+RUNNING_JOB_STALE_SECONDS=600
+JOB_RECOVERY_MAX_ATTEMPTS=3
+JOB_RECOVERY_BATCH_SIZE=100
+```
+
+`extraction_jobs` tablosuna bu özellik için iki sütun eklendi: `recovery_attempts` (kaç kez kurtarılmaya çalışıldığı) ve `last_recovery_at` (son kurtarma denemesinin zamanı — bir sonraki taramanın "ne zamandan beri stale" hesabının referans noktası). Her iki alan da `GET /api/extraction-jobs/{id}` cevabında da döner.
+
+Testler: `tests/test_job_recovery.py` (SQLite birim testleri — taze job'un dokunulmadan kalması, stale queued/running job'ların kurtarılması, max deneme aşımında `failed`'e düşme, batch boyutu sınırı, tamamlanmış/başarısız job'lara dokunulmaması) ve `tests/test_job_recovery_postgres_integration.py` (gerçek PostgreSQL'e karşı — temel kurtarma akışı ve `FOR UPDATE SKIP LOCKED`'ın iki scheduler'ın aynı job'u aynı anda kurtarmasını engellediğinin doğrulanması). PostgreSQL erişilemezse bu testler otomatik `skip` edilir; `POSTGRES_TEST_URL` ile hedef veritabanı değiştirilebilir.
 
 ## Frontend async extraction akışı
 

@@ -75,11 +75,32 @@ services:
       CELERY_TASK_SOFT_TIME_LIMIT_SECONDS: ${CELERY_TASK_SOFT_TIME_LIMIT_SECONDS:-270}
       EXTRACTION_JOB_MAX_RETRIES: ${EXTRACTION_JOB_MAX_RETRIES:-3}
       EXTRACTION_JOB_RETRY_BACKOFF_SECONDS: ${EXTRACTION_JOB_RETRY_BACKOFF_SECONDS:-30}
+      QUEUED_JOB_STALE_SECONDS: ${QUEUED_JOB_STALE_SECONDS:-120}
+      RUNNING_JOB_STALE_SECONDS: ${RUNNING_JOB_STALE_SECONDS:-600}
+      JOB_RECOVERY_MAX_ATTEMPTS: ${JOB_RECOVERY_MAX_ATTEMPTS:-3}
+      JOB_RECOVERY_BATCH_SIZE: ${JOB_RECOVERY_BATCH_SIZE:-100}
     depends_on:
       wikontic:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-beat:
+    build:
+      context: ./Backend/gateway
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - worker.celery_app
+      - beat
+      - --loglevel=INFO
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      JOB_RECOVERY_SWEEP_SECONDS: ${JOB_RECOVERY_SWEEP_SECONDS:-60}
+    depends_on:
       redis:
         condition: service_healthy
 
