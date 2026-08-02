@@ -90,15 +90,15 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 - [x] Giriş ve hesap oluşturma ekranları
 - [ ] Anonim geçmişi hesaba aktarma akışı
 - [ ] Text, PDF ve URL girişi
-- [ ] Extraction job durumunu gösterme
-- [ ] Bekliyor, çalışıyor, tamamlandı ve hata durumları
+- [x] Extraction job durumunu gösterme (doküman → job → polling → triple akışı, bkz. "Frontend async extraction akışı")
+- [x] Bekliyor, çalışıyor, tamamlandı ve hata durumları (`queued`/`running` → "Çalışıyor", `completed` → "Hazır", `failed` → "Hata")
 - [ ] Geçmiş doküman ve extraction listesi
-- [ ] Triple detay ve kaynak kanıt görünümü
+- [ ] Triple detay ve kaynak kanıt görünümü (yalnızca `kaynak_cumle` metni taşınıyor; ayrı bir provenance/evidence görünümü yok)
 - [ ] RAG doğrulama ve consensus sonuçları
 - [ ] Triple düzenleme, reddetme ve onaylama
 - [ ] Sonuç indirme ve dışa aktarma
 - [ ] Kullanım kotası ve model maliyet göstergesi
-- [ ] Hatalarda request ID gösterme
+- [x] Hatalarda request ID gösterme
 - [ ] Veri kullanımı ve gizlilik bilgilendirmesi
 
 ### 4. Backend
@@ -392,6 +392,40 @@ EXTRACTION_JOB_RETRY_BACKOFF_SECONDS=30
 ```
 
 Testler: `tests/test_extraction.py` (adapter/provider/dispatch birim testleri), `tests/test_worker_tasks.py` (Celery `task_always_eager` ile başarı, tekrar teslimde no-op, yarıda kalan işin idempotent yeniden yazımı, kalıcı/geçici hata senaryoları) ve `tests/test_worker_redis_integration.py` (gerçek bir Redis broker'a karşı `celery.contrib.testing.worker.start_worker` ile uçtan uca job teslimi — Redis erişilemezse otomatik `skip` edilir, `REDIS_TEST_URL` ile hedef broker değiştirilebilir).
+
+## Frontend async extraction akışı
+
+Studio arayüzü artık senkron `/api/extract` yerine doküman/job akışını kullanır (mevcut UI tasarımı ve Türkçe triple alanları — `baş`/`ilişki`/`uç` — değişmedi; sadece veri kaynağı değişti). `Frontend/src/App.jsx` içindeki `handleGraphSend` bir sonuç kartı için şu adımları izler:
+
+```text
+POST /api/documents  (metni kaydet)
+        ↓
+POST /api/extraction-jobs  (job'ı başlat)
+        ↓
+GET /api/extraction-jobs/{id}  (2.5 sn'de bir poll)
+        ↓
+queued / running  → kart "Çalışıyor" (loading) gösterir
+        ↓
+completed         → GET /api/extraction-jobs/{id}/triples çağrılır
+        ↓
+failed            → hata mesajı + istek kimliği (X-Request-ID) gösterilir
+```
+
+İlgili dosyalar:
+
+- `Frontend/src/api/extraction.js` — `createDocument`, `createExtractionJob`, `getExtractionJob`, `getJobTriples`, `getDocument` istemcileri ve backend triple şemasını (`subject`/`predicate`/`object`/`evidence`) mevcut Türkçe UI şemasına (`baş`/`ilişki`/`uç`/`kaynak_cumle`) çeviren `mapTriplesToLegacyFormat`.
+- `Frontend/src/api/activeJobsStorage.js` — aktif (henüz `completed`/`failed` olmamış) job kimliklerini `localStorage`'da tutar; sayfa yenilendiğinde `App.jsx`'teki mount effect'i bu kimlikleri okuyup job + doküman durumunu tekrar çekerek kartları geri kurar, terminal duruma ulaşan job'lar listeden otomatik çıkarılır.
+- Polling tek bir `setInterval` (2.5 sn) ile yürütülür ve yalnızca `queued`/`running` durumundaki kartları sorgular; `useEffect` temizleme fonksiyonu component unmount olduğunda (sayfadan ayrılınca) interval'ı durdurur.
+- Job oluşturma anında zaten `completed`/`failed` dönerse (aynı pipeline için mevcut bir job'un yeniden kullanılması durumunda) sonuç ilk poll turunu beklemeden hemen işlenir.
+- Başarısız (`failed`) durumda kart hem `error_message`'ı hem de o anki HTTP cevabının `X-Request-ID` başlığını gösterir.
+
+Testler: `Frontend/src/api/extraction.test.js` (triple eşleme, durum eşleme, süre hesaplama, API istemcisi — `fetch` mock'lanarak) ve `Frontend/src/api/activeJobsStorage.test.js` (localStorage kalıcılığı, bozuk veri/geçersiz kayıtlara dayanıklılık). Çalıştırmak için:
+
+```bash
+cd Frontend
+npm install
+npm test
+```
 
 ## Middleware davranışı
 

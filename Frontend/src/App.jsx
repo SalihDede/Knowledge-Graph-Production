@@ -14,6 +14,18 @@ import {
   getUiText,
   saveLanguage,
 } from './i18n'
+import {
+  computeDurationMs,
+  createDocument,
+  createExtractionJob,
+  getDocument,
+  getExtractionJob,
+  getJobTriples,
+  mapTriplesToLegacyFormat,
+} from './api/extraction'
+import { addActiveJob, loadActiveJobs, removeActiveJob } from './api/activeJobsStorage'
+
+const POLL_INTERVAL_MS = 2500
 
 const GROUPS = [
   {
@@ -371,6 +383,8 @@ function App() {
   const referenceInputRef = useRef(null)
   const wiconticSettingsRef = useRef(null)
   const previousKgRef = useRef(selectedKg)
+  const cardsRef = useRef(cards)
+  const pollingInFlightRef = useRef(new Set())
   const t = getUiText(language)
   const graphGroups = useMemo(() => getLocalizedGroups(t), [t])
 
@@ -413,6 +427,147 @@ function App() {
       })
     })
   }, [selectedKg])
+
+  useEffect(() => {
+    cardsRef.current = cards
+  }, [cards])
+
+  // Reads the extraction job's current state and applies it to the matching
+  // card. Shared by the initial creation flow, the poll interval below, and
+  // the localStorage restore-on-mount effect so all three stay in sync.
+  async function syncJobStatus(cardId, jobId) {
+    if (pollingInFlightRef.current.has(jobId)) return
+    pollingInFlightRef.current.add(jobId)
+
+    try {
+      const { data: job, requestId } = await getExtractionJob(jobId)
+
+      if (job.status === 'completed') {
+        const { data: triples } = await getJobTriples(jobId)
+        const { triplets, highlight } = mapTriplesToLegacyFormat(triples)
+        setCards(prev => prev.map(c => c.id === cardId
+          ? {
+              ...c,
+              status: 'done',
+              jobStatus: 'completed',
+              triplets,
+              highlight,
+              errorMessage: '',
+              completedAt: job.completed_at || new Date().toISOString(),
+              durationMs: computeDurationMs(c.startedAt, job.completed_at),
+            }
+          : c
+        ))
+        removeActiveJob(jobId)
+        return
+      }
+
+      if (job.status === 'failed') {
+        setCards(prev => prev.map(c => c.id === cardId
+          ? {
+              ...c,
+              status: 'error',
+              jobStatus: 'failed',
+              errorMessage: job.error_message || 'Extraction failed.',
+              requestId: requestId || null,
+              completedAt: job.completed_at || new Date().toISOString(),
+              durationMs: computeDurationMs(c.startedAt, job.completed_at),
+            }
+          : c
+        ))
+        removeActiveJob(jobId)
+        return
+      }
+
+      setCards(prev => prev.map(c => c.id === cardId
+        ? { ...c, status: 'loading', jobStatus: job.status }
+        : c
+      ))
+    } catch {
+      // Transient polling failure (network blip, backend restart); the next
+      // interval tick retries automatically.
+    } finally {
+      pollingInFlightRef.current.delete(jobId)
+    }
+  }
+
+  // Restore cards for jobs that were still queued/running when the page was
+  // last closed, so a reload does not silently orphan them.
+  useEffect(() => {
+    const stored = loadActiveJobs()
+    if (stored.length === 0) return
+    let cancelled = false
+
+    async function restore() {
+      const restored = []
+
+      for (const entry of stored.slice(0, 3)) {
+        try {
+          const [{ data: job }, { data: documentRecord }] = await Promise.all([
+            getExtractionJob(entry.jobId),
+            getDocument(entry.documentId),
+          ])
+
+          let triplets = []
+          let highlight = []
+          if (job.status === 'completed') {
+            const { data: triples } = await getJobTriples(entry.jobId)
+            ;({ triplets, highlight } = mapTriplesToLegacyFormat(triples))
+          }
+          if (job.status === 'completed' || job.status === 'failed') {
+            removeActiveJob(entry.jobId)
+          }
+
+          restored.push({
+            id: `restored-${entry.jobId}`,
+            model: job.model,
+            text: documentRecord.normalized_text,
+            kgType: job.kg_type,
+            promptType: job.prompt_type,
+            embeddingModel: job.embedding_model,
+            ontologyLanguage: job.ontology_language,
+            status: job.status === 'completed' ? 'done' : job.status === 'failed' ? 'error' : 'loading',
+            jobStatus: job.status,
+            jobId: entry.jobId,
+            documentId: entry.documentId,
+            triplets,
+            highlight,
+            errorMessage: job.status === 'failed' ? (job.error_message || '') : '',
+            requestId: null,
+            startedAt: job.created_at,
+            completedAt: job.completed_at,
+            durationMs: computeDurationMs(job.created_at, job.completed_at),
+          })
+        } catch {
+          removeActiveJob(entry.jobId)
+        }
+      }
+
+      if (!cancelled && restored.length > 0) {
+        setCards(prev => [...prev, ...restored].slice(0, 3))
+        setSubmitted(true)
+      }
+    }
+
+    restore()
+    return () => { cancelled = true }
+    // Runs once on mount; restoring is a one-time reconciliation with
+    // whatever localStorage held when the app loaded.
+  }, [])
+
+  // Polls every active (queued/running) job on a fixed interval. Reads from
+  // cardsRef instead of `cards` so the interval never needs to be torn down
+  // and rebuilt as cards change; it is cleared on unmount, stopping all
+  // polling as soon as the page is left.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      cardsRef.current
+        .filter(card => card.jobId && (card.jobStatus === 'queued' || card.jobStatus === 'running'))
+        .forEach(card => { syncJobStatus(card.id, card.jobId) })
+    }, POLL_INTERVAL_MS)
+
+    return () => clearInterval(interval)
+  }, [])
 
   const isActive = text.length > 0
   const summaryStats = getCardStats(cards)
@@ -618,7 +773,9 @@ function App() {
   async function handleGraphSend(sel) {
     if (cards.length >= 3) return
     const cardId = Date.now()
-    const startedAt = Date.now()
+    const startedAt = new Date().toISOString()
+    const embeddingModel = sel.embedding || 'contriever'
+    const ontologyLanguage = sel.ontologyLanguage || 'en'
 
     setCards(prev => [...prev, {
       id:             cardId,
@@ -629,60 +786,49 @@ function App() {
       embeddingModel: sel.embedding || null,
       ontologyLanguage: sel.ontologyLanguage || null,
       status:         'loading',
+      jobStatus:      'queued',
+      jobId:          null,
+      documentId:     null,
+      requestId:      null,
       triplets:       [],
       highlight:      [],
       errorMessage:   '',
-      startedAt:      new Date(startedAt).toISOString(),
+      startedAt,
       completedAt:    null,
       durationMs:     null,
     }])
 
     try {
-      const res = await fetch('/api/extract', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({
-          text,
-          model,
-          prompt_type:     sel.prompt || 'temel',
-          kg_type:         sel.kg,
-          embedding_model: sel.embedding || 'contriever',
-          ontology_language: sel.ontologyLanguage || 'en',
-        }),
+      const { data: documentRecord } = await createDocument(text)
+      const { data: job } = await createExtractionJob({
+        documentId: documentRecord.id,
+        model,
+        promptType: sel.prompt || 'temel',
+        kgType: sel.kg,
+        embeddingModel,
+        ontologyLanguage,
       })
-      if (!res.ok) {
-        let message = res.statusText
-        try {
-          const err = await res.json()
-          message = err.detail || message
-        } catch {
-          // Keep the HTTP status text when the backend does not return JSON.
-        }
-        throw new Error(message)
-      }
-      const data = await res.json()
-      const completedAt = Date.now()
+
+      addActiveJob({ jobId: job.id, documentId: documentRecord.id })
       setCards(prev => prev.map(c => c.id === cardId
-        ? {
-            ...c,
-            status: 'done',
-            triplets: data.triplets,
-            highlight: data.highlight ?? [],
-            errorMessage: '',
-            completedAt: new Date(completedAt).toISOString(),
-            durationMs: completedAt - startedAt,
-          }
+        ? { ...c, documentId: documentRecord.id, jobId: job.id, jobStatus: job.status }
         : c
       ))
+
+      // Handles the case where the job was already completed/failed at
+      // creation time (deduplicated against a previous identical job)
+      // instead of waiting for the next poll tick.
+      await syncJobStatus(cardId, job.id)
     } catch (error) {
-      const completedAt = Date.now()
       setCards(prev => prev.map(c => c.id === cardId
         ? {
             ...c,
             status: 'error',
+            jobStatus: 'failed',
             errorMessage: error.message || t.app.llmRequestFailed,
-            completedAt: new Date(completedAt).toISOString(),
-            durationMs: completedAt - startedAt,
+            requestId: error.requestId || null,
+            completedAt: new Date().toISOString(),
+            durationMs: computeDurationMs(startedAt, null),
           }
         : c
       ))
