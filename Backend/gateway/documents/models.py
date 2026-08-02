@@ -81,7 +81,10 @@ class ExtractionJob(Base):
     __tablename__ = "extraction_jobs"
     __table_args__ = (
         Index("ix_extraction_jobs_document_id", "document_id"),
-        Index("ix_extraction_jobs_workspace_id", "workspace_id"),
+        # Covers plain workspace_id lookups too (leftmost-prefix), so it
+        # replaces a separate single-column index; the history listing
+        # filters by workspace_id and always orders by created_at desc.
+        Index("ix_extraction_jobs_workspace_created", "workspace_id", "created_at"),
         Index("ix_extraction_jobs_document_fingerprint", "document_id", "pipeline_fingerprint"),
         Index(
             "ux_extraction_jobs_active_document_fingerprint",

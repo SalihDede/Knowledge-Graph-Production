@@ -45,6 +45,15 @@ function DownloadIcon() {
   )
 }
 
+function ReviewIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 13 13" fill="none">
+      <path d="M2 6.5L5 9.5L11 3"
+        stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/>
+    </svg>
+  )
+}
+
 
 const OPTIMIZED_PROMPT_TYPES = new Set(['ape', 'dspy', 'textgrad'])
 
@@ -68,6 +77,7 @@ export default function ResultCard({
   fileName,
   onDelete,
   onExport,
+  onReview,
   t,
 }) {
   const [expanded, setExpanded] = useState(false)
@@ -102,6 +112,11 @@ export default function ResultCard({
           <h3 className="result-card-title">{title}</h3>
         </div>
         <div className="result-card-actions">
+          {onReview && status === 'done' && !isReference && (
+            <button className="result-card-icon-button" onClick={onReview} aria-label={copy.reviewTriplesAria}>
+              <ReviewIcon />
+            </button>
+          )}
           {onExport && status === 'done' && (
             <button className="result-card-icon-button" onClick={onExport} aria-label={copy.downloadJsonAria}>
               <DownloadIcon />

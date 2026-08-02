@@ -7,15 +7,17 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 
 import policy
 from accounts.runtime import AuthRuntime
+from triples import service as triples_service
 from worker.tasks import run_extraction_job
 from . import service
-from .models import Document, ExtractionJob
+from .models import Document, ExtractionJob, JobStatus
 from .schemas import (
     DocumentCreateRequest,
     DocumentDetail,
     DocumentSummary,
     ExtractionJobCreateRequest,
     ExtractionJobResponse,
+    ExtractionJobSummary,
 )
 
 logger = logging.getLogger(__name__)
@@ -134,6 +136,28 @@ async def get_document(document_id: str, request: Request):
     return _document_detail(document)
 
 
+def _job_summary(entry, triple_count: int) -> ExtractionJobSummary:
+    job = entry.job
+    return ExtractionJobSummary(
+        id=str(job.id),
+        document_id=str(job.document_id),
+        workspace_id=str(job.workspace_id),
+        document_title=entry.document_title,
+        document_preview=entry.document_preview,
+        triple_count=triple_count,
+        model=job.model,
+        kg_type=job.kg_type,
+        prompt_type=job.prompt_type,
+        embedding_model=job.embedding_model,
+        ontology_language=job.ontology_language,
+        status=job.status,
+        error_message=job.error_message,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        completed_at=job.completed_at,
+    )
+
+
 @router.post("/api/extraction-jobs", response_model=ExtractionJobResponse)
 async def create_extraction_job(
     body: ExtractionJobCreateRequest, request: Request, response: Response
@@ -188,6 +212,38 @@ async def create_extraction_job(
 
     response.status_code = status.HTTP_201_CREATED if created else status.HTTP_200_OK
     return _job_response(job)
+
+
+@router.get("/api/extraction-jobs", response_model=list[ExtractionJobSummary])
+async def list_extraction_jobs(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    status: JobStatus | None = Query(default=None),
+    document_id: str | None = Query(default=None),
+):
+    runtime = _runtime(request)
+    user, visitor_id = _identity(request)
+    parsed_document_id = _parse_uuid(document_id) if document_id else None
+
+    async with runtime.sessions() as db:
+        workspace = await service.get_or_create_workspace(db, user=user, visitor_id=visitor_id)
+        entries = await service.list_jobs_for_workspace(
+            db,
+            workspace_id=workspace.id,
+            limit=limit,
+            offset=offset,
+            status=status,
+            document_id=parsed_document_id,
+        )
+        triple_counts = await triples_service.count_triples_by_job(
+            db, job_ids=[entry.job.id for entry in entries]
+        )
+
+    return [
+        _job_summary(entry, triple_counts.get(entry.job.id, 0))
+        for entry in entries
+    ]
 
 
 @router.get("/api/extraction-jobs/{job_id}", response_model=ExtractionJobResponse)

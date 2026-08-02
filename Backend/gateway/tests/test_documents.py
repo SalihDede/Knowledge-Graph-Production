@@ -423,3 +423,144 @@ def test_create_extraction_job_enforces_active_job_limit_per_workspace(
     statuses = [response.status_code for response in responses]
     assert statuses[: policy.MAX_ACTIVE_JOBS_PER_WORKSPACE] == [201] * policy.MAX_ACTIVE_JOBS_PER_WORKSPACE
     assert statuses[-1] == 429
+
+
+def test_list_extraction_jobs_orders_newest_first(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Sıralama testi."}).json()
+        first = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": "test-model", "prompt_type": "temel"},
+        ).json()
+        second = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": "test-model", "prompt_type": "ape"},
+        ).json()
+
+        listing = client.get("/api/extraction-jobs").json()
+
+    assert [job["id"] for job in listing] == [second["id"], first["id"]]
+
+
+def test_list_extraction_jobs_paginates(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Sayfalama testi."}).json()
+        job_ids = []
+        for prompt_type in ["temel", "ape", "dspy"]:
+            job = client.post(
+                "/api/extraction-jobs",
+                json={"document_id": document["id"], "model": "test-model", "prompt_type": prompt_type},
+            ).json()
+            job_ids.append(job["id"])
+
+        first_page = client.get("/api/extraction-jobs", params={"limit": 2, "offset": 0}).json()
+        second_page = client.get("/api/extraction-jobs", params={"limit": 2, "offset": 2}).json()
+
+    assert [job["id"] for job in first_page] == list(reversed(job_ids))[:2]
+    assert [job["id"] for job in second_page] == list(reversed(job_ids))[2:]
+
+
+def test_list_extraction_jobs_filters_by_status(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client:
+        document = client.post("/api/documents", json={"text": "Durum filtresi testi."}).json()
+        client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": "test-model"},
+        )
+
+        queued_only = client.get("/api/extraction-jobs", params={"status": "queued"}).json()
+        completed_only = client.get("/api/extraction-jobs", params={"status": "completed"}).json()
+
+    assert len(queued_only) == 1
+    assert queued_only[0]["status"] == "queued"
+    assert completed_only == []
+
+
+def test_list_extraction_jobs_filters_by_document_id(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client:
+        document_a = client.post("/api/documents", json={"text": "Doküman A."}).json()
+        document_b = client.post("/api/documents", json={"text": "Doküman B."}).json()
+        job_a = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document_a["id"], "model": "test-model"},
+        ).json()
+        client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document_b["id"], "model": "test-model"},
+        )
+
+        filtered = client.get(
+            "/api/extraction-jobs", params={"document_id": document_a["id"]}
+        ).json()
+
+    assert [job["id"] for job in filtered] == [job_a["id"]]
+
+
+def test_list_extraction_jobs_rejects_invalid_status_filter(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client:
+        response = client.get("/api/extraction-jobs", params={"status": "not-a-real-status"})
+
+    assert response.status_code == 422
+
+
+def test_list_extraction_jobs_includes_summary_fields_without_raw_content(documents_app) -> None:
+    import asyncio
+
+    from documents.models import Document, ExtractionJob
+    from triples.service import TripleInput, record_triples_for_job
+
+    app, runtime = documents_app
+    with TestClient(app) as client:
+        document = client.post(
+            "/api/documents",
+            json={"text": "a" * 500, "title": "Uzun Başlık"},
+        ).json()
+        job = client.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": "test-model"},
+        ).json()
+
+        async def seed_triple():
+            async with runtime.sessions() as db:
+                job_row = await db.get(ExtractionJob, uuid.UUID(job["id"]))
+                document_row = await db.get(Document, uuid.UUID(document["id"]))
+                await record_triples_for_job(
+                    db,
+                    job=job_row,
+                    document=document_row,
+                    triples=[TripleInput(subject="A", predicate="rel", object="B")],
+                )
+
+        asyncio.run(seed_triple())
+
+        response = client.get("/api/extraction-jobs")
+
+    body = response.json()
+    assert len(body) == 1
+    entry = body[0]
+    assert entry["document_title"] == "Uzun Başlık"
+    assert entry["triple_count"] == 1
+    assert len(entry["document_preview"]) <= 201  # 200 chars + ellipsis
+    assert "raw_text" not in entry
+    assert "normalized_text" not in entry
+
+
+def test_list_extraction_jobs_is_isolated_per_workspace(documents_app) -> None:
+    app, _ = documents_app
+    with TestClient(app) as client_a, TestClient(app) as client_b:
+        document = client_a.post("/api/documents", json={"text": "İzolasyon testi."}).json()
+        client_a.post(
+            "/api/extraction-jobs",
+            json={"document_id": document["id"], "model": "test-model"},
+        )
+
+        own_listing = client_a.get("/api/extraction-jobs").json()
+        other_listing = client_b.get("/api/extraction-jobs").json()
+
+    assert len(own_listing) == 1
+    assert other_listing == []
