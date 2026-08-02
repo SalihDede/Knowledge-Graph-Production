@@ -79,7 +79,7 @@ Platform anonymous-first çalışacaktır. Kullanıcı giriş yapmadan triple ç
 - [x] Devam eden aynı işlemin tekrar başlatılmasını engelleme
 - [x] Unit ve integration testleri
 
-Temel middleware ve rate limit tamamlandı. Duplicate kontrolü doküman ve job modeliyle birlikte eklendi: doküman içeriği SHA-256 ile hashlenip aynı çalışma alanında tekrar kaydedilmiyor, extraction job'ları ise model, KG yöntemi, prompt, embedding modeli, ontology dili ve pipeline sürümünden üretilen bir fingerprint ile eşleşiyor; devam eden veya tamamlanmış aynı iş varsa yeniden kullanılıyor.
+Temel middleware ve rate limit tamamlandı. Duplicate kontrolü doküman ve job modeliyle birlikte eklendi: doküman içeriği SHA-256 ile hashlenip aynı çalışma alanında tekrar kaydedilmiyor, extraction job'ları ise model, KG yöntemi, prompt, embedding modeli, ontology dili ve pipeline sürümünden üretilen bir fingerprint ile eşleşiyor; devam eden veya tamamlanmış aynı iş varsa yeniden kullanılıyor. Aynı anda gelen iki isteğin aynı job'ı iki kez oluşturması, uygulama seviyesindeki kontrole ek olarak `extraction_jobs` tablosundaki kısmi (partial) unique index ile veritabanı seviyesinde de engelleniyor.
 
 ### 3. Frontend
 
@@ -104,15 +104,16 @@ Mevcut tasarım korunacak ve yeni backend yeteneklerine bağlanacaktır.
 
 Mevcut gateway korunacak ve modüler bir yapıya ayrılacaktır.
 
-- [ ] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları (auth, documents ve extraction-jobs tamamlandı; triples ve models bekliyor)
+- [ ] `auth`, `documents`, `jobs`, `triples` ve `models` route'ları (auth, documents, extraction-jobs ve triples tamamlandı; models bekliyor)
 - [ ] Text, PDF ve URL girişlerini ortak doküman modeline dönüştürme (ilk aşamada yalnızca düz metin destekleniyor)
 - [x] Doküman hash'i ve pipeline fingerprint üretme
 - [x] Extraction job oluşturma
+- [x] Job'a tüm pipeline parametrelerini (model, kg_type, prompt_type, embedding_model, ontology_language) ve pipeline_version'ı kaydetme
 - [ ] Wikontic adapter katmanı
 - [ ] OpenRouter provider katmanı
 - [ ] Model ve prompt ayarlarını doğrulama
-- [ ] Triple ve provenance kaydı
-- [ ] Candidate, verified ve rejected durumları
+- [x] Triple ve provenance kaydı
+- [x] Candidate, verified ve rejected durumları
 - [ ] RAG doğrulama akışı
 - [ ] Çoklu model consensus ve final judge
 - [ ] Global KG'ye yayınlama kontrolü
@@ -131,8 +132,8 @@ PostgreSQL tabloları:
 - [x] `workspaces`
 - [x] `documents`
 - [x] `extraction_jobs`
-- [ ] `triples`
-- [ ] `triple_evidence`
+- [x] `triples`
+- [x] `triple_evidence`
 - [ ] `verification_results`
 - [ ] `pipeline_runs`
 - [ ] `usage_records`
@@ -268,9 +269,46 @@ Extraction job oluşturma isteği:
 }
 ```
 
-Bu parametrelerden (`kg_type`, `prompt_type`, `embedding_model`, `ontology_language`, `model`) bir pipeline fingerprint üretilir. Aynı doküman için aynı fingerprint'e sahip `queued`, `running` veya `completed` durumunda bir job zaten varsa yeni job açılmaz, mevcut job `200` ile döndürülür; yeni job oluşturulduğunda cevap `201` ve durum `queued` olur. Başarısız (`failed`) job'lar için yeniden deneme yeni bir job kaydı açar.
+Bu parametrelerden (`kg_type`, `prompt_type`, `embedding_model`, `ontology_language`, `model`, `pipeline_version`) bir pipeline fingerprint üretilir. Aynı doküman için aynı fingerprint'e sahip `queued`, `running` veya `completed` durumunda bir job zaten varsa yeni job açılmaz, mevcut job `200` ile döndürülür; yeni job oluşturulduğunda cevap `201` ve durum `queued` olur. Başarısız (`failed`) job'lar için yeniden deneme yeni bir job kaydı açar.
+
+`extraction_jobs` tablosu, worker'ın işi nasıl çalıştıracağını bilmesi için gönderilen tüm pipeline parametrelerini (`model`, `kg_type`, `prompt_type`, `embedding_model`, `ontology_language`) ve şemadaki `pipeline_version`'ı ayrı sütunlarda saklar; job cevabında bu alanlar da döner. Aynı doküman + aynı fingerprint için aktif (`queued`/`running`) birden fazla job açılmasını, uygulama kontrolüne ek olarak veritabanındaki kısmi unique index kesin olarak engeller; iki eşzamanlı istek çakışırsa ikincisi mevcut job'ı yeniden kullanır.
 
 Bu aşamada job'lar sadece kayda alınır; kuyruktan tüketilip işlenmesi (Celery worker) sonraki adımda eklenecektir.
+
+## Triple ve provenance API'si
+
+Bir extraction job tamamlandığında çıkarılan triple'lar `triples` tablosunda, bu triple'ların hangi kaynak metinden geldiği ise `triple_evidence` tablosunda saklanır. Her triple `document_id`, `extraction_job_id` ve `workspace_id` ile ilişkilendirilir; böylece bir triple'ın hangi dokümandan, hangi işten ve hangi çalışma alanından geldiği izlenebilir.
+
+```text
+GET   /api/extraction-jobs/{job_id}/triples
+GET   /api/triples/{triple_id}
+PATCH /api/triples/{triple_id}/status
+```
+
+Triple durumları: `candidate` (varsayılan), `verified`, `rejected`. Durum güncelleme isteği:
+
+```json
+{
+  "status": "verified"
+}
+```
+
+Triple cevabı, kaynak paragraf/cümle metnini ve doküman içindeki karakter konumunu (`char_start`, `char_end`) içeren bir `evidence` listesi döndürür:
+
+```json
+{
+  "id": "...",
+  "subject": "Atatürk",
+  "predicate": "doğum_yeri",
+  "object": "Selanik",
+  "status": "candidate",
+  "evidence": [
+    { "source_text": "Atatürk 1881 yılında Selanik'te doğdu.", "char_start": 0, "char_end": 38 }
+  ]
+}
+```
+
+Triple oluşturma bu aşamada genel bir endpoint üzerinden yapılmaz; bu, extraction job'ı işleyecek worker'ın (sonraki adım) sonuçları doğrudan iç servis katmanı üzerinden kaydetmesi için ayrılmıştır. Tüm triple endpointleri, dokümanlar ve job'larla aynı çalışma alanı (workspace) erişim kontrolüne tabidir; başka bir kullanıcıya/ziyaretçiye ait triple'lara erişim `404` döner.
 
 ## Middleware davranışı
 

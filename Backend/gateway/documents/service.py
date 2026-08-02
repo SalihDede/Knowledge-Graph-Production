@@ -3,11 +3,17 @@ from __future__ import annotations
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from accounts.models import User
 from .models import Document, ExtractionJob, JobStatus, Workspace
-from .normalization import compute_content_hash, compute_pipeline_fingerprint, normalize_text
+from .normalization import (
+    PIPELINE_VERSION,
+    compute_content_hash,
+    compute_pipeline_fingerprint,
+    normalize_text,
+)
 
 REUSABLE_JOB_STATUSES = (JobStatus.queued, JobStatus.running, JobStatus.completed)
 
@@ -50,7 +56,7 @@ async def get_or_create_workspace(
     return workspace
 
 
-def _workspace_belongs_to_identity(
+def workspace_belongs_to_identity(
     workspace: Workspace, *, user: User | None, visitor_id: uuid.UUID
 ) -> bool:
     if user is not None:
@@ -106,7 +112,7 @@ async def get_accessible_document(
     if document is None:
         return None
     workspace = await db.get(Workspace, document.workspace_id)
-    if workspace is None or not _workspace_belongs_to_identity(
+    if workspace is None or not workspace_belongs_to_identity(
         workspace, user=user, visitor_id=visitor_id
     ):
         return None
@@ -130,6 +136,20 @@ async def list_documents(
     return list(result)
 
 
+async def _find_reusable_job(
+    db: AsyncSession, *, document_id: uuid.UUID, fingerprint: str
+) -> ExtractionJob | None:
+    return await db.scalar(
+        select(ExtractionJob)
+        .where(
+            ExtractionJob.document_id == document_id,
+            ExtractionJob.pipeline_fingerprint == fingerprint,
+            ExtractionJob.status.in_(REUSABLE_JOB_STATUSES),
+        )
+        .order_by(ExtractionJob.created_at.desc())
+    )
+
+
 async def create_or_reuse_extraction_job(
     db: AsyncSession,
     *,
@@ -142,6 +162,8 @@ async def create_or_reuse_extraction_job(
     ontology_language: str,
     model: str,
 ) -> tuple[ExtractionJob, bool]:
+    document_id = document.id
+    workspace_id = document.workspace_id
     fingerprint = compute_pipeline_fingerprint(
         kg_type=kg_type,
         prompt_type=prompt_type,
@@ -150,28 +172,33 @@ async def create_or_reuse_extraction_job(
         model=model,
     )
 
-    existing = await db.scalar(
-        select(ExtractionJob)
-        .where(
-            ExtractionJob.document_id == document.id,
-            ExtractionJob.pipeline_fingerprint == fingerprint,
-            ExtractionJob.status.in_(REUSABLE_JOB_STATUSES),
-        )
-        .order_by(ExtractionJob.created_at.desc())
-    )
+    existing = await _find_reusable_job(db, document_id=document_id, fingerprint=fingerprint)
     if existing is not None:
         return existing, False
 
     job = ExtractionJob(
-        document_id=document.id,
-        workspace_id=document.workspace_id,
+        document_id=document_id,
+        workspace_id=workspace_id,
         created_by_user_id=user.id if user is not None else None,
         created_by_visitor_id=visitor_id if user is None else None,
+        model=model,
+        kg_type=kg_type,
+        prompt_type=prompt_type,
+        embedding_model=embedding_model,
+        ontology_language=ontology_language,
+        pipeline_version=PIPELINE_VERSION,
         pipeline_fingerprint=fingerprint,
         status=JobStatus.queued,
     )
     db.add(job)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        existing = await _find_reusable_job(db, document_id=document_id, fingerprint=fingerprint)
+        if existing is not None:
+            return existing, False
+        raise
     await db.refresh(job)
     return job, True
 
@@ -187,7 +214,7 @@ async def get_accessible_job(
     if job is None:
         return None
     workspace = await db.get(Workspace, job.workspace_id)
-    if workspace is None or not _workspace_belongs_to_identity(
+    if workspace is None or not workspace_belongs_to_identity(
         workspace, user=user, visitor_id=visitor_id
     ):
         return None

@@ -8,6 +8,7 @@ from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, Integ
 from sqlalchemy.orm import Mapped, mapped_column
 
 from accounts.models import Base, utc_now
+from .normalization import PIPELINE_VERSION
 
 
 class JobStatus(str, enum.Enum):
@@ -82,6 +83,14 @@ class ExtractionJob(Base):
         Index("ix_extraction_jobs_document_id", "document_id"),
         Index("ix_extraction_jobs_workspace_id", "workspace_id"),
         Index("ix_extraction_jobs_document_fingerprint", "document_id", "pipeline_fingerprint"),
+        Index(
+            "ux_extraction_jobs_active_document_fingerprint",
+            "document_id",
+            "pipeline_fingerprint",
+            unique=True,
+            postgresql_where=text("status IN ('queued', 'running')"),
+            sqlite_where=text("status IN ('queued', 'running')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -97,6 +106,12 @@ class ExtractionJob(Base):
     created_by_visitor_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("anonymous_visitors.id", ondelete="SET NULL"), nullable=True
     )
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    kg_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    prompt_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(100), nullable=False)
+    ontology_language: Mapped[str] = mapped_column(String(10), nullable=False)
+    pipeline_version: Mapped[str] = mapped_column(String(20), default=PIPELINE_VERSION, nullable=False)
     pipeline_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[JobStatus] = mapped_column(
         Enum(JobStatus, name="extraction_job_status", native_enum=False, length=20),

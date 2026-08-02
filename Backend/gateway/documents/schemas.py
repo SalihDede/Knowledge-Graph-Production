@@ -46,6 +46,12 @@ class ExtractionJobResponse(BaseModel):
     id: str
     document_id: str
     workspace_id: str
+    model: str
+    kg_type: str
+    prompt_type: str
+    embedding_model: str
+    ontology_language: str
+    pipeline_version: str
     status: JobStatus
     pipeline_fingerprint: str
     result: dict | None
