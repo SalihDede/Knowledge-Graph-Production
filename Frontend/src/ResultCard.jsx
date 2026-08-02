@@ -64,6 +64,7 @@ export default function ResultCard({
   highlight,
   durationMs,
   errorMessage,
+  requestId,
   fileName,
   onDelete,
   onExport,
@@ -191,6 +192,11 @@ export default function ResultCard({
             <p className="result-card-hint result-card-hint--error">
               {errorMessage || 'LLM isteği başarısız.'}
             </p>
+            {requestId && (
+              <p className="result-card-hint result-card-hint--note">
+                {copy.requestIdLabel}: {requestId}
+              </p>
+            )}
           </div>
         )}
 
