@@ -20,6 +20,8 @@ class AuthSettings:
     cookie_domain: str | None
     session_ttl_seconds: int
     visitor_ttl_seconds: int
+    email_verification_ttl_seconds: int = 86400
+    password_reset_ttl_seconds: int = 3600
     visitor_cookie_name: str = "kg_visitor"
     session_cookie_name: str = "kg_session"
 
@@ -41,4 +43,8 @@ class AuthSettings:
             cookie_domain=domain,
             session_ttl_seconds=int(os.getenv("AUTH_SESSION_TTL_SECONDS", "2592000")),
             visitor_ttl_seconds=int(os.getenv("AUTH_VISITOR_TTL_SECONDS", "7776000")),
+            email_verification_ttl_seconds=int(
+                os.getenv("EMAIL_VERIFICATION_TTL_SECONDS", "86400")
+            ),
+            password_reset_ttl_seconds=int(os.getenv("PASSWORD_RESET_TTL_SECONDS", "3600")),
         )

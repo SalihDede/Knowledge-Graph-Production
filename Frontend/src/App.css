@@ -634,6 +634,150 @@
   color: var(--secondary);
 }
 
+.auth-hint {
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.auth-link-button {
+  margin-top: 14px;
+  border: none;
+  background: none;
+  color: var(--secondary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 800;
+  text-decoration: underline;
+}
+
+.auth-verification-panel {
+  width: 100%;
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--surface-tint);
+}
+
+.auth-inline-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.auth-inline-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--muted-strong);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.auth-inline-form input {
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--text);
+}
+
+.auth-sessions {
+  width: 100%;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.auth-sessions h3 {
+  margin: 0 0 10px;
+  color: var(--text);
+  font: 800 13px/1.2 'Manrope', sans-serif;
+}
+
+.auth-session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.auth-session-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface-tint);
+}
+
+.auth-session-item > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.auth-session-item small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.auth-session-revoke {
+  width: auto;
+  min-height: 30px;
+  margin-top: 0;
+  padding: 0 10px;
+  flex-shrink: 0;
+}
+
+.auth-danger-zone {
+  width: 100%;
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.auth-danger-zone h3 {
+  margin: 0 0 10px;
+  color: var(--danger);
+  font: 800 13px/1.2 'Manrope', sans-serif;
+}
+
+.auth-danger-button {
+  width: 100%;
+  min-height: 44px;
+  border: none;
+  border-radius: 8px;
+  background: var(--danger);
+  color: #ffffff;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.auth-danger-button:disabled {
+  cursor: wait;
+  opacity: 0.55;
+}
+
+.auth-danger-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.auth-danger-actions .auth-secondary-button {
+  margin-top: 0;
+}
+
 .language-toggle {
   min-height: 48px;
   display: inline-flex;

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
@@ -33,3 +35,31 @@ class IdentityResponse(BaseModel):
     authenticated: bool
     visitor_id: str
     user: UserResponse | None = None
+
+
+class MessageResponse(BaseModel):
+    detail: str
+
+
+class EmailVerificationConfirmRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=256)
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=10, max_length=128)
+
+
+class SessionSummaryResponse(BaseModel):
+    id: str
+    created_at: datetime
+    last_seen_at: datetime
+    is_current: bool
+
+
+class AccountDeleteRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
