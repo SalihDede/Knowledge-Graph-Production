@@ -16,6 +16,11 @@ from triples.service import build_triple_inputs_from_raw, replace_triples_for_jo
 
 from .celery_app import celery_app
 from .db import build_session_factory
+from .maintenance import (
+    check_wikontic_health,
+    sweep_orphaned_storage_objects,
+    sweep_stale_anonymous_visitors,
+)
 from .recovery import sweep_stale_jobs
 
 logger = logging.getLogger(__name__)
@@ -160,3 +165,43 @@ def recover_stale_jobs() -> None:
     result = asyncio.run(_sweep_and_dispose())
     for job_id in result["requeued"]:
         run_extraction_job.delay(str(job_id))
+
+
+async def _cleanup_visitors_and_dispose() -> int:
+    engine, sessions = build_session_factory()
+    try:
+        return await sweep_stale_anonymous_visitors(sessions)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task
+def cleanup_stale_anonymous_visitors() -> None:
+    """Celery Beat entrypoint: deletes unclaimed anonymous_visitors rows
+    past their cookie's own TTL (and, via ON DELETE CASCADE, anything they
+    solely owned)."""
+    asyncio.run(_cleanup_visitors_and_dispose())
+
+
+async def _cleanup_orphaned_storage_and_dispose() -> int:
+    engine, sessions = build_session_factory()
+    try:
+        return await sweep_orphaned_storage_objects(sessions)
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task
+def cleanup_orphaned_storage_objects() -> None:
+    """Celery Beat entrypoint: deletes MinIO objects with no matching
+    document row (abandoned presigned uploads, or storage left behind by a
+    cascade-deleted document)."""
+    asyncio.run(_cleanup_orphaned_storage_and_dispose())
+
+
+@celery_app.task
+def check_wikontic_health_task() -> None:
+    """Celery Beat entrypoint: periodic MongoDB + embedding-profile health
+    check, logged rather than acted on -- purely observability, unlike the
+    other maintenance tasks above which actually clean something up."""
+    asyncio.run(check_wikontic_health())

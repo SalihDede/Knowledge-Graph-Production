@@ -196,6 +196,63 @@ def ready():
     return {"status": "ok", "service": "wikontic", "mongodb": "ready"}
 
 
+@app.get("/health/profiles")
+def health_profiles():
+    """Per-profile health check for whatever this deployment is configured
+    to serve (WIKONTIC_PROFILES). Polled periodically by the gateway's
+    maintenance sweep (Backend/gateway/worker/maintenance.py) so a profile
+    whose databases were never initialized -- or have gone empty -- is
+    caught proactively, instead of only being discovered when a real
+    extraction request using it fails."""
+    from src.wikontic.profiles import EMBEDDING_PROFILES, ONTOLOGY_PROFILES, resolve_runtime_profile
+
+    def _resolve_by_id(profile_id: str):
+        for op_id, op in ONTOLOGY_PROFILES.items():
+            for ep_id, ep in EMBEDDING_PROFILES.items():
+                if op.language not in ep.compatible_languages:
+                    continue
+                if f"{op.runtime_key}__{ep.embedding_key}" == profile_id:
+                    return resolve_runtime_profile(op_id, ep_id)
+        return None
+
+    configured = [item.strip() for item in os.getenv("WIKONTIC_PROFILES", "en__contriever").split(",") if item.strip()]
+    results: dict = {}
+    overall_ok = True
+
+    try:
+        client = _get_mongo()
+        db_names = set(client.list_database_names())
+    except Exception as exc:
+        return {"status": "degraded", "error": f"MongoDB unreachable: {exc}", "profiles": {}}
+
+    for profile_id in configured:
+        profile = _resolve_by_id(profile_id)
+        if profile is None:
+            results[profile_id] = {"ok": False, "error": "Bilinmeyen profil"}
+            overall_ok = False
+            continue
+        try:
+            ontology_ready = profile.ontology_db_name in db_names and any(
+                client[profile.ontology_db_name][name].estimated_document_count() > 0
+                for name in client[profile.ontology_db_name].list_collection_names()
+            )
+            triplets_ready = profile.triplets_db_name in db_names
+            ok = ontology_ready and triplets_ready
+            results[profile_id] = {
+                "ok": ok,
+                "ontology_db": profile.ontology_db_name,
+                "ontology_db_ready": ontology_ready,
+                "triplets_db": profile.triplets_db_name,
+                "triplets_db_ready": triplets_ready,
+            }
+            overall_ok = overall_ok and ok
+        except Exception as exc:
+            results[profile_id] = {"ok": False, "error": str(exc)}
+            overall_ok = False
+
+    return {"status": "ok" if overall_ok else "degraded", "profiles": results}
+
+
 @app.post("/extract", response_model=ExtractionResponse)
 def extract(req: ExtractionRequest):
     api_logger.info(

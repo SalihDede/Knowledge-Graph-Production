@@ -90,12 +90,24 @@ services:
       RUNNING_JOB_STALE_SECONDS: ${RUNNING_JOB_STALE_SECONDS:-600}
       JOB_RECOVERY_MAX_ATTEMPTS: ${JOB_RECOVERY_MAX_ATTEMPTS:-3}
       JOB_RECOVERY_BATCH_SIZE: ${JOB_RECOVERY_BATCH_SIZE:-100}
+      # Maintenance sweeps (worker/maintenance.py) run on this same
+      # extraction-worker process, dispatched by celery-beat below.
+      AUTH_VISITOR_TTL_SECONDS: ${AUTH_VISITOR_TTL_SECONDS:-7776000}
+      VISITOR_CLEANUP_BATCH_SIZE: ${VISITOR_CLEANUP_BATCH_SIZE:-500}
+      ORPHAN_UPLOAD_GRACE_SECONDS: ${ORPHAN_UPLOAD_GRACE_SECONDS:-86400}
+      MAINTENANCE_HEALTH_CHECK_TIMEOUT_SECONDS: ${MAINTENANCE_HEALTH_CHECK_TIMEOUT_SECONDS:-10}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-kg-documents}
     depends_on:
       wikontic:
         condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     # This runs `celery worker`, not the backend's uvicorn server, so the
     # image's inherited HTTP healthcheck (backend/Dockerfile, port 8000)
@@ -158,6 +170,9 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       JOB_RECOVERY_SWEEP_SECONDS: ${JOB_RECOVERY_SWEEP_SECONDS:-60}
+      VISITOR_CLEANUP_SWEEP_SECONDS: ${VISITOR_CLEANUP_SWEEP_SECONDS:-86400}
+      ORPHAN_STORAGE_SWEEP_SECONDS: ${ORPHAN_STORAGE_SWEEP_SECONDS:-21600}
+      WIKONTIC_HEALTH_CHECK_SWEEP_SECONDS: ${WIKONTIC_HEALTH_CHECK_SWEEP_SECONDS:-300}
     depends_on:
       redis:
         condition: service_healthy
@@ -227,6 +242,9 @@ services:
       HF_HOME: /models/huggingface
       LLM_LOG_LEVEL: ${LLM_LOG_LEVEL:-preview}
       LLM_LOG_PATH: /app/logs/llm_requests.jsonl
+      # Read by GET /health/profiles to know which profiles to check --
+      # must match whatever wikontic-init actually initialized.
+      WIKONTIC_PROFILES: ${WIKONTIC_PROFILES:-en__contriever}
     volumes:
       - wikontic_models:/models
       - wikontic_logs:/app/logs

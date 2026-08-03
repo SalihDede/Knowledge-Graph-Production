@@ -170,12 +170,12 @@ Zamanlanmış görevler:
 
 - [x] Yarım kalan (crash sonrası `running` durumunda takılı kalmış) veya hiç gönderilememiş (`queued` durumunda takılı kalmış) job'ları tespit edip yeniden kuyruğa alma — Celery Beat, bkz. "Job recovery scheduler"
 - [x] Başarısız job'ları sınırlı tekrar deneme (hem worker içindeki geçici-hata retry'ı, hem recovery scheduler'ın `JOB_RECOVERY_MAX_ATTEMPTS` sınırı)
-- [ ] Süresi geçmiş session ve cache kayıtlarını temizleme
-- [ ] Eski geçici dosyaları temizleme
-- [ ] OpenRouter model listesini güncelleme
+- [x] Süresi geçmiş session ve cache kayıtlarını temizleme (anonim ziyaretçi temizliği, bkz. "Bakım cron görevleri")
+- [x] Eski geçici dosyaları temizleme (yetim MinIO nesneleri, bkz. "Bakım cron görevleri")
+- [ ] OpenRouter model listesini güncelleme (bilinçli olarak elle yönetiliyor — allow-list bir güvenlik/maliyet kontrolü, bkz. "Extraction policy")
 - [ ] Kullanım ve maliyet raporları üretme
-- [ ] Candidate triple'ları periyodik benchmark'tan geçirme
-- [ ] MongoDB ve embedding profillerinin sağlık kontrolü
+- [ ] Candidate triple'ları periyodik benchmark'tan geçirme (somut bir kriter/tasarım henüz yok; RAG doğrulama ve consensus aşamalarına ertelendi)
+- [x] MongoDB ve embedding profillerinin sağlık kontrolü (bkz. "Bakım cron görevleri")
 
 Her job idempotent olmalıdır. Worker yeniden başlatıldığında aynı model çağrısı gereksiz yere tekrarlanmamalıdır.
 
@@ -563,6 +563,36 @@ JOB_RECOVERY_BATCH_SIZE=100
 `extraction_jobs` tablosuna bu özellik için iki sütun eklendi: `recovery_attempts` (kaç kez kurtarılmaya çalışıldığı) ve `last_recovery_at` (son kurtarma denemesinin zamanı — bir sonraki taramanın "ne zamandan beri stale" hesabının referans noktası). Her iki alan da `GET /api/extraction-jobs/{id}` cevabında da döner.
 
 Testler: `tests/test_job_recovery.py` (SQLite birim testleri — taze job'un dokunulmadan kalması, stale queued/running job'ların kurtarılması, max deneme aşımında `failed`'e düşme, batch boyutu sınırı, tamamlanmış/başarısız job'lara dokunulmaması) ve `tests/test_job_recovery_postgres_integration.py` (gerçek PostgreSQL'e karşı — temel kurtarma akışı ve `FOR UPDATE SKIP LOCKED`'ın iki scheduler'ın aynı job'u aynı anda kurtarmasını engellediğinin doğrulanması). PostgreSQL erişilemezse bu testler otomatik `skip` edilir; `POSTGRES_TEST_URL` ile hedef veritabanı değiştirilebilir.
+
+## Bakım cron görevleri
+
+Job recovery scheduler'ın yanına, aynı Celery Beat container'ının tetiklediği üç bakım görevi daha eklendi (`worker/maintenance.py`) — hepsi `extraction-worker` sürecinde çalışır, tıpkı `recover_stale_jobs` gibi:
+
+```text
+Celery Beat
+    ├── cleanup-stale-anonymous-visitors    (VISITOR_CLEANUP_SWEEP_SECONDS'te bir)
+    ├── cleanup-orphaned-storage-objects    (ORPHAN_STORAGE_SWEEP_SECONDS'te bir)
+    └── check-wikontic-health               (WIKONTIC_HEALTH_CHECK_SWEEP_SECONDS'te bir)
+```
+
+**Süresi geçmiş anonim ziyaretçi temizliği** (`sweep_stale_anonymous_visitors`): hiçbir hesaba bağlanmamış (`claimed_by_user_id IS NULL`) ve imzalı `kg_visitor` çerezinin kendi ömrü (`AUTH_VISITOR_TTL_SECONDS`) kadar süredir görülmemiş `anonymous_visitors` satırlarını siler. Çerez zaten tarayıcıda geçersiz hale geldiği için bu satırın kalmasının bir anlamı yoktur; silindiğinde mevcut `ON DELETE CASCADE` zinciri (bkz. "Hesap yönetimi genişletmeleri") o ziyaretçinin tek başına sahip olduğu workspace/documents/segments/jobs/triples'ı da otomatik temizler. Bir hesaba bağlanmış (`claimed_by_user_id` dolu) ziyaretçi satırları yaşından bağımsız olarak **hiçbir zaman** silinmez — bunlar hesap ile ilk anonim oturum arasındaki kalıcı bağı temsil eder.
+
+**Yetim MinIO nesnesi temizliği** (`sweep_orphaned_storage_objects`): bucket'taki her nesneyi (`storage.iter_objects`) dolaşıp karşılık gelen bir `documents.storage_key` satırı var mı diye bakar; yoksa (tarayıcının presigned URL ile yükleyip hiç `POST /api/documents/pdf` ile onaylamadığı bir yükleme, ya da satırı cascade ile silinmiş bir doküman) nesneyi siler. Yalnızca `ORPHAN_UPLOAD_GRACE_SECONDS`'ten eski nesneler değerlendirilir, böylece yükleme tamamlanıp onay isteği henüz gitmemiş bir nesne yanlışlıkla silinmez. `ingestion_status=failed` bir dokümanın dosyası **silinmez** — satır hâlâ referans veriyor ve bir yeniden deneme aynı dosyaya ihtiyaç duyabilir; bu görev yalnızca hiçbir `Document` satırının artık referans vermediği nesnelerle ilgilenir.
+
+**MongoDB ve embedding profili sağlık kontrolü** (`check_wikontic_health`): wikontic'in `GET /health/ready` (genel Mongo bağlantısı + API anahtarı) ve yeni eklenen `GET /health/profiles` (her yapılandırılmış profil — `WIKONTIC_PROFILES` — için ontology/triplets veritabanlarının var olup olmadığı ve dolu olup olmadığı) endpoint'lerini çağırıp tek bir yapılandırılmış JSON log satırına (`{"event": "wikontic_health_check", "ok": ..., ...}`) özetler. Bu, mevcut `/api/health/ready` gibi yalnızca istek anında değil, **periyodik ve proaktif** çalışır — bir embedding profilinin veritabanı hiç kurulmamışsa veya boşalmışsa, o profili kullanan gerçek bir extraction isteği başarısız olana kadar beklemek yerine loglardan önceden görülebilir.
+
+Ortam değişkenleri (`.env.example`):
+
+```env
+VISITOR_CLEANUP_SWEEP_SECONDS=86400
+VISITOR_CLEANUP_BATCH_SIZE=500
+ORPHAN_STORAGE_SWEEP_SECONDS=21600
+ORPHAN_UPLOAD_GRACE_SECONDS=86400
+WIKONTIC_HEALTH_CHECK_SWEEP_SECONDS=300
+MAINTENANCE_HEALTH_CHECK_TIMEOUT_SECONDS=10
+```
+
+Testler: `Backend/gateway/tests/test_maintenance.py` (SQLite birim testleri — stale/claimed/recent ziyaretçi senaryoları, cascade doğrulaması `PRAGMA foreign_keys=ON` ile, yetim/referanslı/grace-period içindeki storage nesneleri, `httpx.MockTransport` ile mock'lanmış wikontic health check senaryoları) ve `Backend/wikontic/tests/test_health_profiles.py` (`/health/profiles` endpoint'i — sahte bir Mongo client ile dolu/boş/eksik veritabanı ve bilinmeyen profil senaryoları). Wikontic'in test paketi bu ortamda çalıştırılamadı (`src.wikontic` paketi import zamanında `transformers`/`torch`'u zorunlu kılıyor, bu sandbox'ta kurulu değil) — gerçek wikontic container'ında/CI'de doğrulanmalı.
 
 ## Frontend async extraction akışı
 
