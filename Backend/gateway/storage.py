@@ -98,6 +98,17 @@ def delete_object(object_key: str) -> None:
         pass
 
 
+def iter_objects():
+    """Yields (key, last_modified) for every object in the bucket. Used by
+    the maintenance sweep (worker/maintenance.py) to find uploaded objects
+    with no corresponding document row -- last_modified is a timezone-aware
+    UTC datetime, straight from the S3 API."""
+    paginator = _internal_client().get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=MINIO_BUCKET):
+        for obj in page.get("Contents", []):
+            yield obj["Key"], obj["LastModified"]
+
+
 __all__ = [
     "StorageError",
     "MINIO_BUCKET",
@@ -107,4 +118,5 @@ __all__ = [
     "get_object_bytes",
     "put_object_bytes",
     "delete_object",
+    "iter_objects",
 ]

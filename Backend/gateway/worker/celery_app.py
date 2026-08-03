@@ -26,6 +26,18 @@ celery_app.conf.update(
             "task": "worker.tasks.recover_stale_jobs",
             "schedule": float(os.getenv("JOB_RECOVERY_SWEEP_SECONDS", "60")),
         },
+        "cleanup-stale-anonymous-visitors": {
+            "task": "worker.tasks.cleanup_stale_anonymous_visitors",
+            "schedule": float(os.getenv("VISITOR_CLEANUP_SWEEP_SECONDS", str(24 * 60 * 60))),
+        },
+        "cleanup-orphaned-storage-objects": {
+            "task": "worker.tasks.cleanup_orphaned_storage_objects",
+            "schedule": float(os.getenv("ORPHAN_STORAGE_SWEEP_SECONDS", str(6 * 60 * 60))),
+        },
+        "check-wikontic-health": {
+            "task": "worker.tasks.check_wikontic_health_task",
+            "schedule": float(os.getenv("WIKONTIC_HEALTH_CHECK_SWEEP_SECONDS", "300")),
+        },
     },
     # PDF/URL ingestion (text extraction, OCR, scraping) runs on its own
     # queue/worker so a slow OCR job never delays queued extraction jobs.
