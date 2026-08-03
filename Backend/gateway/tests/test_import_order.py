@@ -38,3 +38,19 @@ def test_worker_celery_app_imports_standalone() -> None:
 def test_documents_routes_imports_standalone() -> None:
     result = _run_import("import documents.routes")
     assert result.returncode == 0, result.stderr
+
+
+def test_accounts_routes_imports_standalone() -> None:
+    """accounts/routes.py (account deletion) deliberately avoids importing
+    anything from documents/ -- it uses raw SQL against the documents/
+    workspaces tables instead -- specifically to avoid re-creating this
+    failure mode in the other direction (accounts <-> documents). This is
+    the regression test for that choice.
+    """
+    result = _run_import("import accounts.routes")
+    assert result.returncode == 0, result.stderr
+
+
+def test_ingestion_url_fetch_imports_standalone() -> None:
+    result = _run_import("import ingestion.url_fetch")
+    assert result.returncode == 0, result.stderr

@@ -53,13 +53,13 @@ Platform anonymous-first çalışacaktır. Kullanıcı giriş yapmadan triple ç
 - [x] Anonim ziyaretçi cookie'si oluşturma
 - [x] Anonim çalışma alanı oluşturma
 - [x] Kayıt, giriş, çıkış ve mevcut kullanıcı endpointleri
-- [ ] E-posta doğrulama
-- [ ] Şifre sıfırlama
+- [x] E-posta doğrulama (bkz. "Hesap yönetimi genişletmeleri")
+- [x] Şifre sıfırlama (bkz. "Hesap yönetimi genişletmeleri")
 - [x] Şifreleri Argon2id ile hashleme
 - [x] HttpOnly server-side session kullanma
 - [x] Anonim geçmişi kayıtlı hesaba aktarma
-- [ ] Aktif oturumları görüntüleme ve kapatma
-- [ ] Hesap ve kullanıcı verilerini silme
+- [x] Aktif oturumları görüntüleme ve kapatma (bkz. "Hesap yönetimi genişletmeleri")
+- [x] Hesap ve kullanıcı verilerini silme (bkz. "Hesap yönetimi genişletmeleri")
 - [ ] Google/GitHub OAuth desteğini sonraki sürümde değerlendirme
 
 ### 2. Middleware
@@ -234,6 +234,45 @@ AUTH_COOKIE_DOMAIN=example.com
 ```
 
 PostgreSQL şeması backend başlarken Alembic tarafından otomatik uygulanır. Redis yalnızca giriş oturumlarını tutar; anonim ziyaretçi kimliği PostgreSQL'de kalıcıdır.
+
+## Hesap yönetimi genişletmeleri
+
+Temel kayıt/giriş/çıkış akışının üzerine e-posta doğrulama, şifre sıfırlama, aktif oturum yönetimi ve hesap silme eklendi.
+
+```text
+POST   /api/auth/email/verification/request   (giriş gerekir)
+POST   /api/auth/email/verification/confirm   {token}
+
+POST   /api/auth/password/reset/request       {email}
+POST   /api/auth/password/reset/confirm       {token, new_password}
+
+GET    /api/auth/sessions                     (giriş gerekir)
+DELETE /api/auth/sessions/{session_id}        (giriş gerekir)
+DELETE /api/auth/sessions?include_current=false  (giriş gerekir)
+
+DELETE /api/auth/account                      {password}  (giriş gerekir)
+```
+
+**E-posta doğrulama ve şifre sıfırlama** aynı `auth_tokens` tablosunu paylaşır (`purpose`: `email_verification` | `password_reset`). Token'ın yalnızca SHA-256 hash'i saklanır — ham token hiçbir zaman veritabanına yazılmaz. Bir kullanıcının aynı amaç için birden fazla geçerli token'ı olamaz: yeni bir token istendiğinde, aynı amaca ait önceki kullanılmamış token'lar silinir.
+
+**E-posta gönderimi henüz bağlı değil** — `_deliver_email_placeholder` (accounts/routes.py) token'ı gerçek bir e-posta yerine yapılandırılmış bir log satırına yazar (`{"event": "auth_email_placeholder", "purpose": ..., "to_email": ..., "token": ...}`). Bu bilinçli bir geliştirme-aşaması yer tutucusudur; gerçek bir sağlayıcı (SMTP/Resend/SendGrid/vb.) seçilmeden **üretime alınmamalıdır** — aksi halde log erişimi olan biri herhangi bir hesabın şifresini sıfırlayabilir. Şifre sıfırlama isteği, e-posta adresi kayıtlı olsun ya da olmasın her zaman aynı cevabı döner (hesap numaralandırma saldırısını önlemek için).
+
+Bir şifre sıfırlama başarıyla tamamlandığında, o kullanıcının **tüm aktif oturumları** iptal edilir — sıfırlama sızmış kimlik bilgileri yüzünden tetiklendiyse, başka bir yerde oturum açık kalmaya devam etmesi tam olarak kapatılmak istenen risktir.
+
+**Aktif oturumlar**, Redis'te oturum verisiyle birlikte `created_at`/`last_seen_at` taşır ve ayrıca `auth:user_sessions:{user_id}` adında bir Redis set'i üzerinden kullanıcı başına indekslenir (bkz. `accounts/store.py::RedisSessionStore`). Oturum listesinde/API cevabında dönen `id`, ham session cookie değeri değil onun SHA-256 hash'idir — bu id'yi öğrenmek oturumu ele geçirmeye yetmez. `DELETE /api/auth/sessions` varsayılan olarak *mevcut oturum hariç* diğer tüm oturumları kapatır; `?include_current=true` mevcut oturumu da kapatıp session cookie'sini temizler.
+
+**Hesap silme**, şifre doğrulaması ister (401 yanlış şifrede). Kullanıcı satırı silindiğinde, veritabanındaki `ON DELETE CASCADE` zinciri workspace → documents → document_segments/extraction_jobs → triples/triple_evidence'ı otomatik temizler. PDF'lerin MinIO'daki binary'leri bu cascade'e dahil olmadığından, silme öncesi `storage_key`'leri toplanıp veritabanı silme işlemi başarıyla tamamlandıktan **sonra** best-effort olarak MinIO'dan da silinir. Bu sorgu bilinçli olarak `documents` ORM modellerini import etmez — ham SQL (`text()` + tip-güvenli `bindparam`) kullanır; `accounts/` paketinin `documents/` paketine import-zamanlı bağımlı hale gelmesini önlemek için (bkz. "Extraction worker" bölümündeki devre bağımlılığı notu — burada aynı sınıf hatayı ters yönde yeniden yaratmamak amaçlanmıştır). Hesap silindiğinde tüm oturumları da iptal edilir ve session cookie'si temizlenir.
+
+Frontend tarafı: `AuthPanel.jsx`'teki hesap görünümüne e-posta doğrulama (iste + token ile onayla), "Şifremi unuttum" akışı (giriş ekranından erişilir), aktif oturumlar listesi (tek tek veya toplu kapatma) ve "Tehlikeli bölge" içinde şifre onaylı hesap silme eklendi. Gerçek e-posta gönderimi olmadığından, doğrulama/sıfırlama token'ı arayüzde bir metin kutusuna elle girilir (geliştirme ortamında sunucu loglarından okunur).
+
+Ortam değişkenleri (`.env.example`):
+
+```env
+EMAIL_VERIFICATION_TTL_SECONDS=86400
+PASSWORD_RESET_TTL_SECONDS=3600
+```
+
+Testler: `tests/test_account_management.py` (e-posta doğrulama, şifre sıfırlama + oturum iptali, oturum listeleme/tekil-toplu iptal, hesap silme + gerçek cascade doğrulaması — SQLite'ta `PRAGMA foreign_keys=ON` açılarak test edilir, çünkü SQLite bu pragma olmadan `ON DELETE CASCADE`'i sessizce yok sayar — + MinIO temizliği mock'lanarak) ve `tests/test_import_order.py::test_accounts_routes_imports_standalone` (accounts/routes.py'nin documents/'a import-zamanlı bağımlı olmadığının regresyon testi).
 
 ## Doküman ve extraction job API'si
 

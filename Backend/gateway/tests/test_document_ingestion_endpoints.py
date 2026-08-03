@@ -15,31 +15,11 @@ from accounts.middleware import IdentityMiddleware
 from accounts.models import Base
 from accounts.routes import router as auth_router
 from accounts.runtime import AuthRuntime
-from accounts.security import create_session_token
-from accounts.store import SessionData
 import documents.models  # noqa: F401  (register tables on Base.metadata)
 from documents.models import IngestionStatus
 from documents.routes import router as documents_router
 import documents.routes as documents_routes
-
-
-class MemorySessionStore:
-    def __init__(self):
-        self.sessions: dict[str, SessionData] = {}
-
-    async def create(self, data: SessionData) -> str:
-        token = create_session_token()
-        self.sessions[token] = data
-        return token
-
-    async def get(self, token: str) -> SessionData | None:
-        return self.sessions.get(token)
-
-    async def delete(self, token: str) -> None:
-        self.sessions.pop(token, None)
-
-    async def ping(self) -> bool:
-        return True
+from fakes import MemorySessionStore
 
 
 def _build_documents_app(tmp_path: Path):
