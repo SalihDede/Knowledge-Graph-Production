@@ -97,6 +97,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # This runs `celery worker`, not the backend's uvicorn server, so the
+    # image's inherited HTTP healthcheck (backend/Dockerfile, port 8000)
+    # always fails here even when the worker is healthy -- disable it so
+    # `docker compose ps` reflects reality instead of a false "unhealthy".
+    healthcheck:
+      disable: true
 
   ingestion-worker:
     build:
@@ -134,6 +140,10 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # See extraction-worker above: no HTTP server on this command, so the
+    # inherited image healthcheck would always report "unhealthy".
+    healthcheck:
+      disable: true
 
   celery-beat:
     build:
@@ -151,6 +161,10 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # See extraction-worker above: no HTTP server on this command, so the
+    # inherited image healthcheck would always report "unhealthy".
+    healthcheck:
+      disable: true
 
   postgres:
     image: postgres:17-alpine
